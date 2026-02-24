@@ -29,8 +29,10 @@ pnpm-debug.log*
 # android local / build cache
 android/.gradle/
 android/local.properties
+android/keystore.properties
 android/**/build/
 android/captures/
+tmp_*/
 
 # editors / OS
 .idea/
