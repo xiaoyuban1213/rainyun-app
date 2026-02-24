@@ -1,0 +1,59 @@
+{
+  "version": "1.0.7",
+  "downloadUrl": "http://ros.yuban.cloud/app/RainYun-App-v1.0.7-release.apk",
+  "notes": "1.0.7 正式版：修复开屏进度条在系统关闭动画场景下卡住的问题，新增进度模式兜底；优化侧滑返回与安卓返回逻辑，Tab主界面不再参与返回栈切换。",
+  "sha256": "BDB68B2BC9D6C2D71D541897A0568435DD33D23E9C16296676CAAA16D034C0B6",
+  "buildTime": "2026-02-25T03:22:24+08:00",
+  "force": false,
+  "history": [
+    {
+      "version": "1.0.7",
+      "notes": "1.0.7 正式版：修复开屏进度条在系统关闭动画场景下卡住的问题，新增进度模式兜底；优化侧滑返回与安卓返回逻辑，Tab主界面不再参与返回栈切换。",
+      "buildTime": "2026-02-25T03:22:24+08:00",
+      "downloadUrl": "http://ros.yuban.cloud/app/RainYun-App-v1.0.7-release.apk",
+      "sha256": "BDB68B2BC9D6C2D71D541897A0568435DD33D23E9C16296676CAAA16D034C0B6"
+    },
+    {
+      "version": "1.0.6",
+      "notes": "1.0.6 发布版：优化推广中心与分享体验，完善平板/横屏适配、监控展示与整体交互动效。",
+      "buildTime": "2026-02-25T00:00:00+08:00",
+      "downloadUrl": "http://ros.yuban.cloud/app/RainYun-App-v1.0.6-release.apk",
+      "sha256": ""
+    },
+    {
+      "version": "1.0.5",
+      "notes": "1.0.5 发布版：新增关于应用自定义弹窗，补充 SDK/API 致谢与免责声明，优化窄屏溢出与界面可读性。",
+      "buildTime": "2026-02-24T00:00:00+08:00",
+      "downloadUrl": "http://ros.yuban.cloud/app/RainYun-App-v1.0.5-release.apk",
+      "sha256": ""
+    },
+    {
+      "version": "1.0.4",
+      "notes": "1.0.4 发布版：完善优惠券与代办事项联动，修复相关页面请求与展示问题。",
+      "buildTime": "2026-02-23T00:00:00+08:00",
+      "downloadUrl": "http://ros.yuban.cloud/app/RainYun-App-v1.0.4-release.apk",
+      "sha256": ""
+    },
+    {
+      "version": "1.0.3",
+      "notes": "1.0.3 发布版：修复收益字段与详情页可读性问题，优化产品详情与监控显示。",
+      "buildTime": "2026-02-22T00:00:00+08:00",
+      "downloadUrl": "http://ros.yuban.cloud/app/RainYun-App-v1.0.3-release.apk",
+      "sha256": ""
+    },
+    {
+      "version": "1.0.2",
+      "notes": "1.0.2 发布版：优化移动端导航与页面稳定性，修复若干接口字段映射问题。",
+      "buildTime": "2026-02-21T00:00:00+08:00",
+      "downloadUrl": "http://ros.yuban.cloud/app/RainYun-App-v1.0.2-release.apk",
+      "sha256": ""
+    },
+    {
+      "version": "1.0.1",
+      "notes": "1.0.1 首个稳定版：完成底部导航（主页/推广中心/我的）与核心页面联动。",
+      "buildTime": "2026-02-20T00:00:00+08:00",
+      "downloadUrl": "http://ros.yuban.cloud/app/RainYun-App-v1.0.1-release.apk",
+      "sha256": ""
+    }
+  ]
+}

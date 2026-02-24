@@ -1,0 +1,20 @@
+{
+  "name": "雨云 App Web",
+  "short_name": "雨云Web",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#070f1b",
+  "theme_color": "#0b1220",
+  "icons": [
+    {
+      "src": "https://cdn.apifox.com/app/project-icon/custom/20231116/e416b172-004f-452f-8090-8e85991f422c.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "https://cdn.apifox.com/app/project-icon/custom/20231116/e416b172-004f-452f-8090-8e85991f422c.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}
