@@ -12,7 +12,7 @@ import "@arco-design/web-vue/es/typography/style/css.js";
 
 const BRAND_LOGO = "https://cdn.apifox.com/app/project-icon/custom/20231116/e416b172-004f-452f-8090-8e85991f422c.png";
 const AVATAR = "https://i.pravatar.cc/120?img=32";
-const APP_VERSION = "1.0.7";
+const APP_VERSION = "1.0.8";
 const UPDATE_BASE_URL = "http://ros.yuban.cloud/app";
 const UPDATE_FEED_URL = `${UPDATE_BASE_URL}/latest.json`;
 
@@ -1321,7 +1321,6 @@ const ProductDetailPage = {
 
       <section class="panel action-grid">
         <a-button class="line-btn" size="medium" type="outline" @click="loadDetail">刷新数据</a-button>
-        <a-button class="line-btn" size="medium" type="outline" @click="goList">返回列表</a-button>
       </section>
     </MobileShell>
   `,
