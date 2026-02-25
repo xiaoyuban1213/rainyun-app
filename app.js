@@ -15,6 +15,57 @@ const AVATAR = "https://i.pravatar.cc/120?img=32";
 const APP_VERSION = "1.0.8";
 const UPDATE_BASE_URL = "http://ros.yuban.cloud/app";
 const UPDATE_FEED_URL = `${UPDATE_BASE_URL}/latest.json`;
+let navOriginTrackerInited = false;
+
+function setNavOrigin(clientX, clientY) {
+  if (typeof document === "undefined") return;
+  const root = document.documentElement;
+  const app = document.querySelector(".mobile-app");
+  if (app) {
+    const rect = app.getBoundingClientRect();
+    const x = Math.max(0, Math.min(rect.width, clientX - rect.left));
+    const y = Math.max(0, Math.min(rect.height, clientY - rect.top));
+    const cx = rect.width / 2;
+    const cy = rect.height / 2;
+    const shiftX = (cx - x) * 0.06;
+    const shiftY = (cy - y) * 0.06;
+    root.style.setProperty("--nav-origin-x", `${x}px`);
+    root.style.setProperty("--nav-origin-y", `${y}px`);
+    root.style.setProperty("--nav-shift-x", `${shiftX.toFixed(2)}px`);
+    root.style.setProperty("--nav-shift-y", `${shiftY.toFixed(2)}px`);
+    return;
+  }
+  root.style.setProperty("--nav-origin-x", `${Math.max(0, clientX)}px`);
+  root.style.setProperty("--nav-origin-y", `${Math.max(0, clientY)}px`);
+  root.style.setProperty("--nav-shift-x", "0px");
+  root.style.setProperty("--nav-shift-y", "0px");
+}
+
+function initNavOriginTracker() {
+  if (typeof window === "undefined") return;
+  if (navOriginTrackerInited) return;
+  navOriginTrackerInited = true;
+  const setCenter = () => {
+    if (typeof document === "undefined") return;
+    const app = document.querySelector(".mobile-app");
+    if (app) {
+      const rect = app.getBoundingClientRect();
+      setNavOrigin(rect.left + rect.width / 2, rect.top + rect.height / 2);
+    } else {
+      setNavOrigin(window.innerWidth / 2, window.innerHeight / 2);
+    }
+  };
+  const onPointerDown = (e) => setNavOrigin(e.clientX, e.clientY);
+  const onTouchStart = (e) => {
+    if (!e.touches || !e.touches.length) return;
+    const t = e.touches[0];
+    setNavOrigin(t.clientX, t.clientY);
+  };
+  setCenter();
+  window.addEventListener("pointerdown", onPointerDown, { passive: true, capture: true });
+  window.addEventListener("touchstart", onTouchStart, { passive: true, capture: true });
+  window.addEventListener("resize", setCenter, { passive: true });
+}
 
 const store = reactive({
   auth: loadAuth(),
@@ -28,6 +79,9 @@ const store = reactive({
   lastSyncAt: ""
 });
 let summaryInflightPromise = null;
+const apiGetCache = new Map();
+const apiGetInflight = new Map();
+const API_GET_DEFAULT_TTL = 8000;
 
 function toast(msg) {
   const el = document.getElementById("toast");
@@ -71,6 +125,8 @@ function saveAuth(nextAuth) {
     devToken: (nextAuth.devToken || "").trim()
   };
   localStorage.setItem("rainyun-auth", JSON.stringify(store.auth));
+  apiGetCache.clear();
+  apiGetInflight.clear();
   reportLog("INFO", "auth_saved", { hasApiKey: Boolean(store.auth.apiKey), hasDevToken: Boolean(store.auth.devToken) });
 }
 
@@ -239,8 +295,39 @@ function toAbsoluteUrl(url, base) {
   return `${String(base).replace(/\/$/, "")}/${raw.replace(/^\.\//, "")}`;
 }
 
-async function apiGet(path) {
-  return apiRequest("GET", path);
+function apiGetCacheKey(path) {
+  return `${String(store.auth.baseUrl || "").trim()}|${String(store.auth.apiKey || "").trim()}|${path}`;
+}
+
+async function apiGet(path, options = {}) {
+  const force = Boolean(options.force);
+  const ttlMs = Number.isFinite(Number(options.ttlMs)) ? Math.max(0, Number(options.ttlMs)) : API_GET_DEFAULT_TTL;
+  const key = apiGetCacheKey(path);
+
+  if (!force && ttlMs > 0) {
+    const cached = apiGetCache.get(key);
+    if (cached && Date.now() - cached.at < ttlMs) {
+      return cached.payload;
+    }
+  }
+
+  if (!force && apiGetInflight.has(key)) {
+    return apiGetInflight.get(key);
+  }
+
+  const p = apiRequest("GET", path)
+    .then((payload) => {
+      if (ttlMs > 0) {
+        apiGetCache.set(key, { at: Date.now(), payload });
+      }
+      return payload;
+    })
+    .finally(() => {
+      apiGetInflight.delete(key);
+    });
+
+  apiGetInflight.set(key, p);
+  return p;
 }
 
 async function apiRequest(method, path, body) {
@@ -287,40 +374,53 @@ async function refreshSummary(force = false) {
   if (!store.auth.apiKey) return;
   if (!force && store.rawSummary && store.userProfile) return;
   if (summaryInflightPromise) return summaryInflightPromise;
+  if (force) {
+    apiGetCache.clear();
+  }
 
   summaryInflightPromise = (async () => {
     store.loading = true;
     try {
-      // Load user profile for avatar/name/id first.
-      try {
-        const userPayload = await apiGet("/user/");
-        store.userProfile = userPayload && userPayload.data ? userPayload.data : userPayload;
-      } catch (e) {
-        reportLog("WARN", "user_profile_load_error", { error: String(e) });
-      }
-    try {
-      const couponPayload = await apiGet("/user/coupons/");
-      const couponData = extractPayloadData(couponPayload);
-      store.userCoupons = Array.isArray(couponData) ? couponData : [];
-    } catch (e) {
-        store.userCoupons = [];
-        reportLog("WARN", "user_coupons_load_error", { error: String(e) });
-    }
-    try {
-      const newsPayload = await apiGet("/news");
-      const newsData = extractPayloadData(newsPayload);
-      store.homeNews = Array.isArray(newsData) ? newsData : [];
-    } catch (e) {
-      store.homeNews = [];
-      reportLog("WARN", "home_news_load_error", { error: String(e) });
-    }
+      const [userRes, couponRes, newsRes, productRes] = await Promise.allSettled([
+        apiGet("/user/", { force, ttlMs: 15000 }),
+        apiGet("/user/coupons/", { force, ttlMs: 10000 }),
+        apiGet("/news", { force, ttlMs: 10000 }),
+        apiGet("/product/", { force, ttlMs: 10000 })
+      ]);
 
-    const p1 = await apiGet("/product/");
+      if (userRes.status === "fulfilled") {
+        const userPayload = userRes.value;
+        store.userProfile = userPayload && userPayload.data ? userPayload.data : userPayload;
+      } else {
+        reportLog("WARN", "user_profile_load_error", { error: String(userRes.reason) });
+      }
+
+      if (couponRes.status === "fulfilled") {
+        const couponData = extractPayloadData(couponRes.value);
+        store.userCoupons = Array.isArray(couponData) ? couponData : [];
+      } else {
+        store.userCoupons = [];
+        reportLog("WARN", "user_coupons_load_error", { error: String(couponRes.reason) });
+      }
+
+      if (newsRes.status === "fulfilled") {
+        const newsData = extractPayloadData(newsRes.value);
+        store.homeNews = Array.isArray(newsData) ? newsData : [];
+      } else {
+        store.homeNews = [];
+        reportLog("WARN", "home_news_load_error", { error: String(newsRes.reason) });
+      }
+
+      if (productRes.status !== "fulfilled") {
+        throw productRes.reason || new Error("产品列表请求失败");
+      }
+
+      const p1 = productRes.value;
       let s = normalizeSummary(p1);
       let source = "/product/";
 
       if (summaryIsEmpty(s)) {
-        const p2 = await apiGet("/product/id_list");
+        const p2 = await apiGet("/product/id_list", { force, ttlMs: 10000 });
         const s2 = normalizeSummary(p2);
         if (!summaryIsEmpty(s2)) {
           s = s2;
@@ -968,6 +1068,7 @@ const TodoPage = {
     const ticketRows = ref([]);
     const renewRows = ref([]);
     const couponRows = ref([]);
+    let todoInflight = null;
 
     function queryOptions(page = 1, perPage = 20) {
       return encodeURIComponent(JSON.stringify({
@@ -1133,21 +1234,26 @@ const TodoPage = {
     }
 
     async function loadData() {
+      if (todoInflight) return todoInflight;
       loading.value = true;
       errorText.value = "";
-      try {
-        if (type.value === "ticket") {
-          await loadTickets();
-        } else if (type.value === "renew") {
-          await loadRenews();
-        } else if (type.value === "coupon") {
-          await loadCoupons();
+      todoInflight = (async () => {
+        try {
+          if (type.value === "ticket") {
+            await loadTickets();
+          } else if (type.value === "renew") {
+            await loadRenews();
+          } else if (type.value === "coupon") {
+            await loadCoupons();
+          }
+        } catch (e) {
+          errorText.value = String(e);
+        } finally {
+          loading.value = false;
+          todoInflight = null;
         }
-      } catch (e) {
-        errorText.value = String(e);
-      } finally {
-        loading.value = false;
-      }
+      })();
+      return todoInflight;
     }
 
     const title = computed(() => {
@@ -1836,7 +1942,16 @@ const MePage = {
           </div>
           <div class="kv"><span>版本</span><b>{{ appVersion }}</b></div>
           <div class="kv"><span>更新源</span><b class="about-url">{{ updateBaseUrl }}</b></div>
-          <div class="kv"><span>技术栈</span><b>Vue+Vue Router+Arco Design Vue+Vite+Capacitor</b></div>
+          <div class="kv kv-stack">
+            <span>技术栈</span>
+            <div class="about-tech-tags">
+              <a-tag size="small" color="arcoblue">Vue 3</a-tag>
+              <a-tag size="small" color="cyan">Vue Router 4</a-tag>
+              <a-tag size="small" color="blue">Arco Design Vue</a-tag>
+              <a-tag size="small" color="green">Vite 5</a-tag>
+              <a-tag size="small" color="purple">Capacitor 7</a-tag>
+            </div>
+          </div>
           <div class="about-block">
             <h4>致谢</h4>
             <p>感谢 RainYun 官方 API 提供数据能力。</p>
@@ -2173,3 +2288,5 @@ if ("serviceWorker" in navigator) {
 window.addEventListener("error", (e) => {
   reportLog("ERROR", "window_error", { message: e.message, source: e.filename, line: e.lineno });
 });
+
+initNavOriginTracker();
