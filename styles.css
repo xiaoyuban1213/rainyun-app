@@ -516,6 +516,15 @@ body {
 }
 
 .action-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+/* 针对只有一个按钮的action-grid（刷新数据按钮） */
+.action-grid:has(> .line-btn:nth-child(1):only-child) {
+  display: flex;
+  justify-content: center;
+}
+.action-grid:has(> .line-btn:nth-child(1):only-child) .line-btn {
+  width: 200%;
+  max-width: 300px;
+}
 .line-btn {
   height: 38px;
   border-radius: 11px;
@@ -684,6 +693,9 @@ body {
   position: relative;
   overflow: hidden;
 }
+.primary-btn.arco-btn {
+  border-radius: 11px !important;
+}
 .primary-btn::after {
   content: "";
   position: absolute;
@@ -699,10 +711,13 @@ body {
 .primary-btn.arco-btn {
   border: 0;
   color: #fff;
+  height: 40px !important;
 }
 .primary-btn.arco-btn-primary {
   background: linear-gradient(120deg, var(--primary), #4da7ea);
   border-color: transparent;
+  height: 40px !important;
+  border-radius: 11px !important;
 }
 .primary-btn:active { transform: scale(.985); filter: brightness(.98); }
 .btn-row .line-btn {
@@ -808,6 +823,14 @@ body {
   grid-template-columns: 1fr 1fr;
   gap: 8px;
   margin-top: 12px;
+}
+.about-actions .line-btn {
+  width: 100%;
+  height: 40px;
+}
+.about-actions .primary-btn {
+  width: 100%;
+  height: 40px;
 }
 .link-btn { color: #1aa9b9; background: none; border: 0; font-weight: 700; }
 .muted { color: var(--muted); margin: 0; }
