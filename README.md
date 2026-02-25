@@ -75,6 +75,7 @@ npm run android:debug
 4. 计算 SHA256
 5. 更新根目录 `latest.json`（保留 `history` 历史日志）
 6. 上传 APK 与 `latest.json` 到 S3
+7. 可选：同步创建/更新 GitHub Release 并上传 APK
 
 PowerShell 示例：
 
@@ -87,6 +88,8 @@ $env:S3_SECRET_ACCESS_KEY = "<secret-key>"
 $env:S3_PREFIX = "app"
 $env:PUBLIC_BASE_URL = "http://ros.yuban.cloud"
 $env:RELEASE_NOTES = "1.0.x 发布说明..."
+$env:GITHUB_TOKEN = "<github-personal-access-token>"
+$env:GITHUB_REPO = "xiaoyuban1213/rainyun-app"
 npm run release:publish
 ```
 
@@ -95,6 +98,10 @@ npm run release:publish
 - `S3_PREFIX` 默认 `app`，最终对象如 `app/latest.json`、`app/RainYun-App-vX.Y.Z-release.apk`
 - `PUBLIC_BASE_URL` 用于生成 `latest.json.downloadUrl`
 - `S3_FORCE_PATH_STYLE` 默认 `true`（可选）
+- 配置 `GITHUB_TOKEN` + `GITHUB_REPO` 后，会自动同步到 GitHub Releases
+- `GITHUB_REPO` 支持 `owner/repo` 或完整 URL
+- 可选参数：`GITHUB_TAG_NAME`、`GITHUB_RELEASE_NAME`、`GITHUB_RELEASE_LATEST`（默认 `true`）
+- 默认 `GITHUB_TAG_NAME=release`，即持续更新同一个 Release
 
 ## `latest.json` 结构
 
@@ -135,3 +142,6 @@ npm run release:publish
 - 仓库已通过 `.gitignore` 忽略 APK、密钥、环境文件、编辑器与构建缓存
 - 不要提交 `keystore`、`local.properties`、`.env*`
 - 发布前确认 `APP_VERSION`、`RELEASE_NOTES`、`latest.json` 是否一致
+
+
+

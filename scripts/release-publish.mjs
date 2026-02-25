@@ -120,6 +120,134 @@ async function uploadToS3({ endpoint, region, bucket, accessKeyId, secretAccessK
   }));
 }
 
+function parseGitHubRepo(repo) {
+  const val = String(repo || "").trim().replace(/^https?:\/\/github\.com\//i, "").replace(/\.git$/i, "").replace(/^\/+|\/+$/g, "");
+  const [owner, name] = val.split("/");
+  if (!owner || !name) return null;
+  return { owner, repo: name };
+}
+
+async function githubRequest({ token, method, path, body, isJson = true }) {
+  const headers = {
+    Authorization: `Bearer ${token}`,
+    "User-Agent": "rainyun-app-release-script",
+    Accept: "application/vnd.github+json"
+  };
+  if (isJson) headers["Content-Type"] = "application/json";
+  const res = await fetch(`https://api.github.com${path}`, {
+    method,
+    headers,
+    body: body == null ? undefined : (isJson ? JSON.stringify(body) : body)
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`GitHub API ${method} ${path} 失败: ${res.status} ${text}`);
+  }
+  if (res.status === 204) return null;
+  const text = await res.text();
+  return text ? JSON.parse(text) : null;
+}
+
+async function githubUploadAsset({ token, uploadUrlTemplate, filePath, fileName }) {
+  const uploadUrl = uploadUrlTemplate.replace(/\{.*\}$/, "");
+  const url = `${uploadUrl}?name=${encodeURIComponent(fileName)}`;
+  const body = fs.readFileSync(filePath);
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "User-Agent": "rainyun-app-release-script",
+      Accept: "application/vnd.github+json",
+      "Content-Type": "application/vnd.android.package-archive"
+    },
+    body
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`GitHub 上传资产失败: ${res.status} ${text}`);
+  }
+  const text = await res.text();
+  return text ? JSON.parse(text) : null;
+}
+
+async function publishGitHubRelease({
+  token,
+  owner,
+  repo,
+  version,
+  releaseNotes,
+  apkFilePath,
+  apkFileName,
+  sha256,
+  buildTime
+}) {
+  const tagName = process.env.GITHUB_TAG_NAME?.trim() || "release";
+  const releaseName = process.env.GITHUB_RELEASE_NAME?.trim() || `RainYun-App-v${version}-release`;
+  const makeLatest = String(process.env.GITHUB_RELEASE_LATEST || "true").toLowerCase() !== "false";
+  const body = `${version} 发布日志` + "\n\n" + `${releaseNotes}` + "\n\n" + `- sha256: ${sha256}` + "\n" + `- buildTime: ${buildTime}`;
+
+  let release = null;
+  try {
+    release = await githubRequest({
+      token,
+      method: "GET",
+      path: `/repos/${owner}/${repo}/releases/tags/${encodeURIComponent(tagName)}`
+    });
+  } catch (e) {
+    if (!String(e.message).includes("404")) throw e;
+  }
+
+  if (!release) {
+    release = await githubRequest({
+      token,
+      method: "POST",
+      path: `/repos/${owner}/${repo}/releases`,
+      body: {
+        tag_name: tagName,
+        name: releaseName,
+        body,
+        draft: false,
+        prerelease: false,
+        make_latest: makeLatest ? "true" : "false"
+      }
+    });
+    console.log(`[ok] 已创建 GitHub Release: ${tagName}`);
+  } else {
+    release = await githubRequest({
+      token,
+      method: "PATCH",
+      path: `/repos/${owner}/${repo}/releases/${release.id}`,
+      body: {
+        name: releaseName,
+        body,
+        draft: false,
+        prerelease: false,
+        make_latest: makeLatest ? "true" : "false"
+      }
+    });
+    console.log(`[ok] 已更新 GitHub Release: ${tagName}`);
+  }
+
+  const assets = Array.isArray(release.assets) ? release.assets : [];
+  const old = assets.find((a) => a && a.name === apkFileName);
+  if (old?.id) {
+    await githubRequest({
+      token,
+      method: "DELETE",
+      path: `/repos/${owner}/${repo}/releases/assets/${old.id}`
+    });
+    console.log(`[ok] 已删除同名旧资产: ${apkFileName}`);
+  }
+
+  await githubUploadAsset({
+    token,
+    uploadUrlTemplate: release.upload_url,
+    filePath: apkFilePath,
+    fileName: apkFileName
+  });
+  console.log(`[ok] 已上传 GitHub Release 资产: ${apkFileName}`);
+}
+
 async function main() {
   const version = readVersionFromAppJs();
   const apkName = `RainYun-App-v${version}-release.apk`;
@@ -195,9 +323,32 @@ async function main() {
   console.log(`[done] version=${version}`);
   console.log(`[done] downloadUrl=${downloadUrl}`);
   console.log(`[done] sha256=${sha256}`);
+
+  const githubToken = process.env.GITHUB_TOKEN?.trim() || "";
+  const githubRepoInput = process.env.GITHUB_REPO?.trim() || "";
+  if (githubToken && githubRepoInput) {
+    const parsed = parseGitHubRepo(githubRepoInput);
+    if (!parsed) {
+      throw new Error("GITHUB_REPO 格式错误，示例：xiaoyuban1213/rainyun-app");
+    }
+    await publishGitHubRelease({
+      token: githubToken,
+      owner: parsed.owner,
+      repo: parsed.repo,
+      version,
+      releaseNotes,
+      apkFilePath: apkOut,
+      apkFileName: apkName,
+      sha256,
+      buildTime
+    });
+  } else {
+    console.log("[skip] 未配置 GITHUB_TOKEN 或 GITHUB_REPO，跳过 GitHub Releases 同步。");
+  }
 }
 
 main().catch((e) => {
   console.error("[release-publish] 失败:", e);
   process.exit(1);
 });
+

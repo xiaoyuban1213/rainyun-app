@@ -1757,7 +1757,6 @@ const PromoPage = {
           await Share.share({
             title: "雨云推广链接",
             text: `通过我的邀请码注册雨云：${link}`,
-            url: link,
             dialogTitle: "分享邀请链接"
           });
           return;
@@ -1838,7 +1837,7 @@ const MePage = {
           </div>
           <div class="kv"><span>版本</span><b>{{ appVersion }}</b></div>
           <div class="kv"><span>更新源</span><b class="about-url">{{ updateBaseUrl }}</b></div>
-          <div class="kv"><span>技术栈</span><b>Vue + Vite + Capacitor</b></div>
+          <div class="kv"><span>技术栈</span><b>Vue+Vue Router+Arco Design Vue+Vite+Capacitor</b></div>
           <div class="about-block">
             <h4>致谢</h4>
             <p>感谢 RainYun 官方 API 提供数据能力。</p>
