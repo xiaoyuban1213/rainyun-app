@@ -171,6 +171,15 @@ function parseGitHubRepo(repo) {
   return { owner, repo: name };
 }
 
+function resolveTemplate(input, context = {}) {
+  const raw = String(input ?? "").trim();
+  if (!raw) return "";
+  return raw.replace(/\{(\w+)\}/g, (_, key) => {
+    const v = context[key];
+    return v === undefined || v === null ? "" : String(v);
+  });
+}
+
 async function githubRequest({ token, method, path, body, isJson = true }) {
   const headers = {
     Authorization: `Bearer ${token}`,
@@ -225,8 +234,10 @@ async function publishGitHubRelease({
   sha256,
   buildTime
 }) {
-  const tagName = getConfig("GITHUB_TAG_NAME", { defaultValue: "release" });
-  const releaseName = getConfig("GITHUB_RELEASE_NAME", { defaultValue: `RainYun-App-v${version}-release` });
+  const tagTemplate = getConfig("GITHUB_TAG_NAME", { defaultValue: "v{version}" });
+  const releaseNameTemplate = getConfig("GITHUB_RELEASE_NAME", { defaultValue: "RainYun-App-v{version}-release" });
+  const tagName = resolveTemplate(tagTemplate, { version }) || `v${version}`;
+  const releaseName = resolveTemplate(releaseNameTemplate, { version }) || `RainYun-App-v${version}-release`;
   const makeLatest = String(getConfig("GITHUB_RELEASE_LATEST", { defaultValue: "true" })).toLowerCase() !== "false";
   const body = `${version} 发布日志` + "\n\n" + `${releaseNotes}` + "\n\n" + `- sha256: ${sha256}` + "\n" + `- buildTime: ${buildTime}`;
 

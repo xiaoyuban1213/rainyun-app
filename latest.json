@@ -1,11 +1,18 @@
 {
-  "version": "1.0.9",
-  "downloadUrl": "http://ros.yuban.cloud/app/RainYun-App-v1.0.9-release.apk",
-  "notes": "1.0.9 发布版：perf: improve navigation animation smoothness and API request efficiency；修复分享会出现多链接问题；Update UI；Update styles.css。",
-  "sha256": "C3A06785E480BE5F3BB9C9311CB63606AED9AFF4B49DB7D6130F0A4D19A32146",
-  "buildTime": "2026-02-25T16:23:17+08:00",
+  "version": "1.0.10",
+  "downloadUrl": "http://ros.yuban.cloud/app/RainYun-App-v1.0.10-release.apk",
+  "notes": "优化待续费逻辑。",
+  "sha256": "BA133E0C71CE43C9FED0720242FCA0DDA65945A9AAAFB1D0F4186A40848B779A",
+  "buildTime": "2026-02-25T16:49:26+08:00",
   "force": false,
   "history": [
+    {
+      "version": "1.0.10",
+      "notes": "优化待续费逻辑。",
+      "buildTime": "2026-02-25T16:49:26+08:00",
+      "downloadUrl": "http://ros.yuban.cloud/app/RainYun-App-v1.0.10-release.apk",
+      "sha256": "BA133E0C71CE43C9FED0720242FCA0DDA65945A9AAAFB1D0F4186A40848B779A"
+    },
     {
       "version": "1.0.9",
       "notes": "1.0.9 发布版：perf: improve navigation animation smoothness and API request efficiency；修复分享会出现多链接问题；Update UI；Update styles.css。",

@@ -12,7 +12,7 @@ import "@arco-design/web-vue/es/typography/style/css.js";
 
 const BRAND_LOGO = "https://cdn.apifox.com/app/project-icon/custom/20231116/e416b172-004f-452f-8090-8e85991f422c.png";
 const AVATAR = "https://i.pravatar.cc/120?img=32";
-const APP_VERSION = "1.0.9";
+const APP_VERSION = "1.0.10";
 const UPDATE_BASE_URL = "http://ros.yuban.cloud/app";
 const UPDATE_FEED_URL = `${UPDATE_BASE_URL}/latest.json`;
 let navOriginTrackerInited = false;
@@ -71,6 +71,8 @@ const store = reactive({
   auth: loadAuth(),
   loading: false,
   summary: { domain: [], rca: [], rcs: [], rgpu: [], rgs: [], ssl_order: [] },
+  renewDueCount: 0,
+  renewDueRows: [],
   productOverview: null,
   summarySource: "",
   rawSummary: null,
@@ -373,6 +375,109 @@ async function apiRequest(method, path, body) {
   throw new Error(`网络请求失败，请检查 Base URL/网络：${String(lastError || "unknown")}`);
 }
 
+function parseExpireForRenew(v) {
+  if (v === null || v === undefined || v === "") return { text: "-", daysText: "-", days: Number.POSITIVE_INFINITY };
+  const n = Number(v);
+  let d;
+  if (Number.isFinite(n)) {
+    if (n <= 0) return { text: "-", daysText: "-", days: Number.POSITIVE_INFINITY };
+    const ms = n > 1000000000000 ? n : (n > 1000000000 ? n * 1000 : n);
+    d = new Date(ms);
+  } else {
+    d = new Date(String(v));
+  }
+  if (Number.isNaN(d.getTime())) return { text: String(v), daysText: "-", days: Number.POSITIVE_INFINITY };
+  const diffMs = d.getTime() - Date.now();
+  const days = Math.ceil(diffMs / 86400000);
+  const daysText = days < 0 ? `已过期 ${Math.abs(days)} 天` : `剩余 ${days} 天`;
+  return { text: d.toLocaleString(), daysText, days };
+}
+
+function renewDetailPath(kindName, productId) {
+  if (kindName === "rcs") return `/product/rcs/${productId}/`;
+  if (kindName === "rgpu") return `/product/rcs/${productId}/`;
+  if (kindName === "rgs") return `/product/rgs/${productId}/`;
+  if (kindName === "rca") return `/product/rca/project/${productId}/`;
+  if (kindName === "domain") return `/product/domain/${productId}/`;
+  return "";
+}
+
+async function tryGetRenewPrice(kindName, id) {
+  try {
+    if (kindName !== "rcs" && kindName !== "rgpu" && kindName !== "rgs") return "";
+    const renewKind = kindName === "rgpu" ? "rcs" : kindName;
+    const p = await apiGet(`/product/${renewKind}/price?scene=renew&product_id=${id}&duration=1&with_coupon_id=0&is_old=true`);
+    const d = extractPayloadData(p) || {};
+    const v = pickFirstFieldDeep(d, ["price", "renew", "detail.per_scene.renew"]);
+    const perScene = d.detail && d.detail.per_scene ? d.detail.per_scene : {};
+    const renewValue = perScene.renew !== undefined ? perScene.renew : v;
+    const n = toNumberOrNull(renewValue);
+    return n === null ? "" : `¥ ${n.toFixed(2)}`;
+  } catch {
+    return "";
+  }
+}
+
+async function collectRenewRowsFromSummary(summary, options = {}) {
+  const maxDays = Number.isFinite(Number(options.maxDays)) ? Number(options.maxDays) : 7;
+  const includeRenewPrice = Boolean(options.includeRenewPrice);
+  const kinds = ["rcs", "rgpu", "rgs", "rca", "domain"];
+  const rows = [];
+  const tasks = [];
+
+  for (const kindName of kinds) {
+    const ids = (summary?.[kindName] || []).slice(0, 30);
+    for (const productId of ids) {
+      tasks.push(async () => {
+        const detailPath = renewDetailPath(kindName, productId);
+        if (!detailPath) return null;
+        try {
+          const payload = await apiGet(detailPath, { ttlMs: 15000 });
+          const detailData = extractPayloadData(payload);
+          const d = detailData && detailData.Data && typeof detailData.Data === "object" ? detailData.Data : detailData;
+          const name = String(
+            pickFirstFieldDeep(d, ["name", "domain", "OsName", "HostName", "title", "domain_name"]) ||
+            `${getKindLabel(kindName)} #${productId}`
+          );
+          const statusRaw = String(pickFirstFieldDeep(d, ["status", "Status", "state"]) || "-");
+          const autoRaw = pickFirstFieldDeep(d, ["AutoRenew", "auto_renew", "expire_notice"]);
+          const expRaw = pickFirstFieldDeep(d, ["ExpDate", "exp_date", "expired_at", "expire_at", "end_time", "due_time"]);
+          const exp = parseExpireForRenew(expRaw);
+          if (!(Number.isFinite(exp.days) && exp.days >= 0 && exp.days <= maxDays)) return null;
+          const renewPrice = includeRenewPrice ? await tryGetRenewPrice(kindName, productId) : "";
+          return {
+            kind: kindName,
+            kindLabel: getKindLabel(kindName),
+            id: String(productId),
+            name,
+            statusText: statusRaw,
+            autoRenewText: (String(autoRaw).toLowerCase() === "true" || String(autoRaw) === "1") ? "已开启" : "未开启",
+            expireAt: exp.text,
+            daysText: exp.daysText,
+            days: exp.days,
+            renewPrice
+          };
+        } catch {
+          return null;
+        }
+      });
+    }
+  }
+
+  let cursor = 0;
+  const concurrency = 6;
+  async function worker() {
+    while (cursor < tasks.length) {
+      const idx = cursor;
+      cursor += 1;
+      const item = await tasks[idx]();
+      if (item) rows.push(item);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, tasks.length) }, () => worker()));
+  return rows.sort((a, b) => a.days - b.days).slice(0, 50);
+}
+
 function isRgpuLikeRcsDetail(detailData) {
   const d = detailData && detailData.Data && typeof detailData.Data === "object" ? detailData.Data : detailData;
   const texts = [
@@ -428,7 +533,12 @@ async function splitRcsAndRgpuIds(rcsIds, force = false) {
 
 async function refreshSummary(force = false) {
   if (!store.auth.apiKey) return;
-  if (!force && store.rawSummary && store.userProfile) return;
+  if (!force && store.rawSummary && store.userProfile) {
+    const rows = await collectRenewRowsFromSummary(store.summary || {}, { maxDays: 7, includeRenewPrice: false });
+    store.renewDueRows = rows;
+    store.renewDueCount = rows.length;
+    return;
+  }
   if (summaryInflightPromise) return summaryInflightPromise;
   if (force) {
     apiGetCache.clear();
@@ -502,12 +612,23 @@ async function refreshSummary(force = false) {
       store.summary = s;
       store.summarySource = source;
       store.lastSyncAt = new Date().toLocaleTimeString();
+      try {
+        const rows = await collectRenewRowsFromSummary(s, { maxDays: 7, includeRenewPrice: false });
+        store.renewDueRows = rows;
+        store.renewDueCount = rows.length;
+      } catch (e) {
+        reportLog("WARN", "renew_due_count_error", { error: String(e) });
+        store.renewDueRows = [];
+        store.renewDueCount = 0;
+      }
       if (summaryIsEmpty(s)) {
         toast("当前账号暂无产品数据");
       }
     } catch (e) {
       toast(String(e));
       reportLog("ERROR", "summary_load_error", { error: String(e) });
+      store.renewDueRows = [];
+      store.renewDueCount = 0;
     } finally {
       store.loading = false;
       summaryInflightPromise = null;
@@ -1182,7 +1303,10 @@ const HomePage = {
     });
     const productTotal = computed(() => productEntries.value.reduce((sum, item) => sum + Number(item.count || 0), 0));
     const tickets = computed(() => 0);
-    const renew = computed(() => summary.value.rcs.length + summary.value.rgpu.length + summary.value.rgs.length + summary.value.rca.length);
+    const renew = computed(() => {
+      const n = Number(store.renewDueCount);
+      return Number.isFinite(n) && n >= 0 ? n : 0;
+    });
     const coupons = computed(() => (Array.isArray(store.userCoupons) ? store.userCoupons.length : 0));
     const syncing = computed(() => store.loading);
     const lastSyncAt = computed(() => store.lastSyncAt);
@@ -1328,33 +1452,6 @@ const TodoPage = {
       return String(raw || "-");
     }
 
-    function parseExpire(v) {
-      if (v === null || v === undefined || v === "") return { text: "-", daysText: "-", days: Number.POSITIVE_INFINITY };
-      const n = Number(v);
-      let d;
-      if (Number.isFinite(n)) {
-        if (n <= 0) return { text: "-", daysText: "-", days: Number.POSITIVE_INFINITY };
-        const ms = n > 1000000000000 ? n : (n > 1000000000 ? n * 1000 : n);
-        d = new Date(ms);
-      } else {
-        d = new Date(String(v));
-      }
-      if (Number.isNaN(d.getTime())) return { text: String(v), daysText: "-", days: Number.POSITIVE_INFINITY };
-      const diffMs = d.getTime() - Date.now();
-      const days = Math.ceil(diffMs / 86400000);
-      const daysText = days < 0 ? `已过期 ${Math.abs(days)} 天` : `剩余 ${days} 天`;
-      return { text: d.toLocaleString(), daysText, days };
-    }
-
-    function endpointFor(kindName, productId) {
-      if (kindName === "rcs") return `/product/rcs/${productId}/`;
-      if (kindName === "rgpu") return `/product/rcs/${productId}/`;
-      if (kindName === "rgs") return `/product/rgs/${productId}/`;
-      if (kindName === "rca") return `/product/rca/project/${productId}/`;
-      if (kindName === "domain") return `/product/domain/${productId}/`;
-      return "";
-    }
-
     async function loadTickets() {
       const payload = await apiGet(`/workorder/?options=${queryOptions(1, 20)}`);
       const data = extractPayloadData(payload) || {};
@@ -1367,79 +1464,12 @@ const TodoPage = {
       }));
     }
 
-    async function tryGetRenewPrice(kindName, id) {
-      try {
-        if (kindName !== "rcs" && kindName !== "rgpu" && kindName !== "rgs") return "";
-        const renewKind = kindName === "rgpu" ? "rcs" : kindName;
-        const p = await apiGet(`/product/${renewKind}/price?scene=renew&product_id=${id}&duration=1&with_coupon_id=0&is_old=true`);
-        const d = extractPayloadData(p) || {};
-        const v = pickFirstFieldDeep(d, ["price", "renew", "detail.per_scene.renew"]);
-        const perScene = d.detail && d.detail.per_scene ? d.detail.per_scene : {};
-        const renewValue = perScene.renew !== undefined ? perScene.renew : v;
-        const n = toNumberOrNull(renewValue);
-        return n === null ? "" : `¥ ${n.toFixed(2)}`;
-      } catch {
-        return "";
-      }
-    }
-
     async function loadRenews() {
       await refreshSummary(false);
-      const kinds = ["rcs", "rgpu", "rgs", "rca", "domain"];
-      const rows = [];
-      const tasks = [];
-      for (const kindName of kinds) {
-        const ids = (store.summary[kindName] || []).slice(0, 30);
-        for (const productId of ids) {
-          tasks.push(async () => {
-            const detailPath = endpointFor(kindName, productId);
-            if (!detailPath) return null;
-            try {
-              const payload = await apiGet(detailPath);
-              const detailData = extractPayloadData(payload);
-              const d = detailData && detailData.Data && typeof detailData.Data === "object" ? detailData.Data : detailData;
-              const name = String(
-                pickFirstFieldDeep(d, ["name", "domain", "OsName", "HostName", "title", "domain_name"]) ||
-                `${getKindLabel(kindName)} #${productId}`
-              );
-              const statusRaw = String(pickFirstFieldDeep(d, ["status", "Status", "state"]) || "-");
-              const autoRaw = pickFirstFieldDeep(d, ["AutoRenew", "auto_renew", "expire_notice"]);
-              const expRaw = pickFirstFieldDeep(d, ["ExpDate", "exp_date", "expired_at", "expire_at", "end_time", "due_time"]);
-              const exp = parseExpire(expRaw);
-              const renewPrice = await tryGetRenewPrice(kindName, productId);
-              return {
-                kind: kindName,
-                kindLabel: getKindLabel(kindName),
-                id: String(productId),
-                name,
-                statusText: statusRaw,
-                autoRenewText: (String(autoRaw).toLowerCase() === "true" || String(autoRaw) === "1") ? "已开启" : "未开启",
-                expireAt: exp.text,
-                daysText: exp.daysText,
-                days: exp.days,
-                renewPrice
-              };
-            } catch {
-              return null;
-            }
-          });
-        }
-      }
-      const concurrency = 5;
-      let cursor = 0;
-      async function worker() {
-        while (cursor < tasks.length) {
-          const idx = cursor;
-          cursor += 1;
-          const item = await tasks[idx]();
-          if (item) rows.push(item);
-        }
-      }
-      await Promise.all(Array.from({ length: Math.min(concurrency, tasks.length) }, () => worker()));
-      renewRows.value = rows
-        .filter((row) => Number.isFinite(row.days) && row.days <= 7)
-        .sort((a, b) => a.days - b.days)
-        .slice(0, 50);
+      const rows = await collectRenewRowsFromSummary(store.summary, { maxDays: 7, includeRenewPrice: true });
+      store.renewDueRows = rows.map((x) => ({ ...x, renewPrice: "" }));
+      store.renewDueCount = store.renewDueRows.length;
+      renewRows.value = rows;
     }
 
     async function loadCoupons() {

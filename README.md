@@ -101,7 +101,10 @@ npm run release:publish
 - 配置 `GITHUB_TOKEN` + `GITHUB_REPO` 后，会自动同步到 GitHub Releases
 - `GITHUB_REPO` 支持 `owner/repo` 或完整 URL
 - 可选参数：`GITHUB_TAG_NAME`、`GITHUB_RELEASE_NAME`、`GITHUB_RELEASE_LATEST`（默认 `true`）
-- 默认 `GITHUB_TAG_NAME=release`，即持续更新同一个 Release
+- 默认 `GITHUB_TAG_NAME=v{version}`，每次版本发布会创建新的 Release（不会覆盖历史）
+- `GITHUB_TAG_NAME` / `GITHUB_RELEASE_NAME` 支持模板变量 `{version}`，例如：
+  - `GITHUB_TAG_NAME=v{version}`
+  - `GITHUB_RELEASE_NAME=RainYun-App-v{version}-release`
 - `RELEASE_NOTES` 留空时会自动使用最近提交信息生成发布说明
 
 ## `latest.json` 结构
