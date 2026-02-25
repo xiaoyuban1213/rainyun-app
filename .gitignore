@@ -16,6 +16,8 @@ pnpm-debug.log*
 .env
 .env.*
 !.env.example
+release.local.json
+release.local.*.json
 *.pem
 *.p12
 *.jks

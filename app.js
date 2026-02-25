@@ -12,7 +12,7 @@ import "@arco-design/web-vue/es/typography/style/css.js";
 
 const BRAND_LOGO = "https://cdn.apifox.com/app/project-icon/custom/20231116/e416b172-004f-452f-8090-8e85991f422c.png";
 const AVATAR = "https://i.pravatar.cc/120?img=32";
-const APP_VERSION = "1.0.8";
+const APP_VERSION = "1.0.9";
 const UPDATE_BASE_URL = "http://ros.yuban.cloud/app";
 const UPDATE_FEED_URL = `${UPDATE_BASE_URL}/latest.json`;
 let navOriginTrackerInited = false;
@@ -70,7 +70,8 @@ function initNavOriginTracker() {
 const store = reactive({
   auth: loadAuth(),
   loading: false,
-  summary: { domain: [], rca: [], rcs: [], ssl_order: [] },
+  summary: { domain: [], rca: [], rcs: [], rgpu: [], rgs: [], ssl_order: [] },
+  productOverview: null,
   summarySource: "",
   rawSummary: null,
   userProfile: null,
@@ -144,12 +145,14 @@ function normalizeSummary(payload) {
     domain: list(data.domain),
     rca: list(data.rca),
     rcs: list(data.rcs),
+    rgpu: list(data.rgpu),
+    rgs: list(data.rgs),
     ssl_order: list(data.ssl_order)
   };
 }
 
 function summaryIsEmpty(s) {
-  return !s.domain.length && !s.rca.length && !s.rcs.length && !s.ssl_order.length;
+  return !s.domain.length && !s.rca.length && !s.rcs.length && !s.rgpu.length && !s.rgs.length && !s.ssl_order.length;
 }
 
 function normalizeAssetUrl(url) {
@@ -370,6 +373,59 @@ async function apiRequest(method, path, body) {
   throw new Error(`网络请求失败，请检查 Base URL/网络：${String(lastError || "unknown")}`);
 }
 
+function isRgpuLikeRcsDetail(detailData) {
+  const d = detailData && detailData.Data && typeof detailData.Data === "object" ? detailData.Data : detailData;
+  const texts = [
+    d?.OsName,
+    d?.HostName,
+    d?.Plan?.subtype,
+    d?.Plan?.plan_name,
+    d?.Plan?.machine,
+    d?.Plan?.chinese,
+    d?.Node?.Subtype,
+    d?.Node?.Machine,
+    d?.Node?.ChineseName
+  ]
+    .map((x) => String(x || "").toLowerCase())
+    .filter(Boolean)
+    .join(" ");
+
+  // 兼容常见显卡机型/命名，避免显卡云混入云服务器列表。
+  return /(gpu|v100|a100|a800|h100|h800|l20|l40|p40|p100|tesla|rtx|quadro|4090|4080|4070|4060|3090)/i.test(texts);
+}
+
+async function splitRcsAndRgpuIds(rcsIds, force = false) {
+  const ids = [...new Set((Array.isArray(rcsIds) ? rcsIds : []).map((x) => String(x)).filter(Boolean))];
+  if (!ids.length) return { rcs: [], rgpu: [] };
+
+  const rcs = [];
+  const rgpu = [];
+  const concurrency = 6;
+  let cursor = 0;
+
+  async function worker() {
+    while (cursor < ids.length) {
+      const idx = cursor;
+      cursor += 1;
+      const id = ids[idx];
+      try {
+        const payload = await apiGet(`/product/rcs/${id}/`, { force, ttlMs: 15000 });
+        const detail = extractPayloadData(payload);
+        if (isRgpuLikeRcsDetail(detail)) {
+          rgpu.push(id);
+        } else {
+          rcs.push(id);
+        }
+      } catch {
+        rcs.push(id);
+      }
+    }
+  }
+
+  await Promise.all(Array.from({ length: Math.min(concurrency, ids.length) }, () => worker()));
+  return { rcs, rgpu };
+}
+
 async function refreshSummary(force = false) {
   if (!store.auth.apiKey) return;
   if (!force && store.rawSummary && store.userProfile) return;
@@ -416,6 +472,7 @@ async function refreshSummary(force = false) {
       }
 
       const p1 = productRes.value;
+      store.productOverview = extractPayloadData(p1);
       let s = normalizeSummary(p1);
       let source = "/product/";
 
@@ -431,6 +488,15 @@ async function refreshSummary(force = false) {
         }
       } else {
         store.rawSummary = p1;
+      }
+
+      // API 的 id_list 中，显卡云可能混在 rcs 内；这里按明细字段拆分为独立 rgpu。
+      if (Array.isArray(s.rcs) && s.rcs.length) {
+        const split = await splitRcsAndRgpuIds(s.rcs, force);
+        s.rcs = split.rcs;
+        s.rgpu = [...new Set([...(Array.isArray(s.rgpu) ? s.rgpu : []), ...split.rgpu])];
+      } else if (!Array.isArray(s.rgpu)) {
+        s.rgpu = [];
       }
 
       store.summary = s;
@@ -452,7 +518,7 @@ async function refreshSummary(force = false) {
 }
 
 function getKindLabel(kind) {
-  const map = { rcs: "云服务器", rca: "云应用", domain: "域名服务", ssl_order: "SSL证书" };
+  const map = { rcs: "云服务器", rgpu: "显卡云电脑", rca: "云应用", rgs: "游戏云", domain: "域名服务", ssl_order: "SSL证书" };
   return map[kind] || kind;
 }
 
@@ -571,6 +637,32 @@ function buildDetailView(kind, id, detailData, monitorData) {
   const dataRoot = detailData && typeof detailData === "object" && detailData.Data && typeof detailData.Data === "object"
     ? detailData.Data
     : detailData;
+  const countFromAny = (...vals) => {
+    for (const v of vals) {
+      if (Array.isArray(v)) return v.length;
+      const n = Number(v);
+      if (Number.isFinite(n) && n >= 0) return Math.floor(n);
+    }
+    return 0;
+  };
+  const addonCounts = (d) => {
+    const rbs = countFromAny(detailEnvelope.RBSList, d.RBSList, d.Backup);
+    const eDisk = countFromAny(detailEnvelope.EDiskList, d.EDiskList, Number(d.DataDisk) > 0 ? 1 : 0);
+    const ipByList = countFromAny(detailEnvelope.EIPList, d.EIPList);
+    const natByList = countFromAny(detailEnvelope.NatList, d.NatList);
+    const natIp = String(d.NatPublicIP || d.MainIPv4 || "").trim();
+    const ipCount = ipByList > 0 ? ipByList : (natByList > 0 ? natByList : (natIp && natIp !== "-" ? 1 : 0));
+    const vnetByList = countFromAny(detailEnvelope.VNets, d.VNets);
+    const vnetCount = vnetByList > 0 ? vnetByList : (Number(d.VnetID || 0) > 0 ? 1 : 0);
+    return { rbs, eDisk, ipCount, vnetCount };
+  };
+  const getChargeTypeText = (raw) => {
+    const s = String(raw || "").toLowerCase();
+    if (!s) return "-";
+    if (s.includes("dynamic")) return "动态计费";
+    if (s.includes("elastic")) return "固定计费";
+    return String(raw);
+  };
   const pick = (...keys) => {
     for (const key of keys) {
       const val = pickFirstFieldDeep(dataRoot, [key]);
@@ -586,24 +678,22 @@ function buildDetailView(kind, id, detailData, monitorData) {
   const expireRaw = pick("ExpDate", "expired_at", "expire_at", "end_time", "due_time");
   const expireAt = Number(expireRaw) > 1000000000 ? new Date(Number(expireRaw) * 1000).toLocaleString() : (expireRaw || "-");
 
-  if (kind === "rcs") {
+  if (kind === "rcs" || kind === "rgpu") {
     const d = dataRoot || {};
     const plan = d.Plan || {};
     const node = d.Node || {};
     const usage = d.UsageData || {};
-    // RCS detail response places these arrays at data root (same level as Data), not inside Data.
-    const rbsList = Array.isArray(detailEnvelope.RBSList) ? detailEnvelope.RBSList : (Array.isArray(d.RBSList) ? d.RBSList : []);
-    const eDiskList = Array.isArray(detailEnvelope.EDiskList) ? detailEnvelope.EDiskList : (Array.isArray(d.EDiskList) ? d.EDiskList : []);
+    const counts = addonCounts(d);
     const eipList = Array.isArray(detailEnvelope.EIPList) ? detailEnvelope.EIPList : (Array.isArray(d.EIPList) ? d.EIPList : []);
-    const vnets = Array.isArray(detailEnvelope.VNets) ? detailEnvelope.VNets : (Array.isArray(d.VNets) ? d.VNets : []);
     const ipv6 = eipList.find((x) => String(x.Type || "").toLowerCase().includes("ipv6"));
     const showIp = (ipv6 && ipv6.IP) || d.NatPublicIP || d.MainIPv4 || "-";
+    const lineText = String(plan.line || node.IpZone || d.Zone || node.Region || "-");
     const baseInfo = [
-      { key: "产品类型", value: "云服务器" },
+      { key: "产品类型", value: kind === "rgpu" ? "显卡云电脑" : "云服务器" },
       { key: "产品ID", value: String(id) },
       { key: "名称", value: d.OsName || d.HostName || "-" },
       { key: "状态", value: d.Status || "-" },
-      { key: "地域", value: node.Region || "-" },
+      { key: "线路", value: lineText },
       { key: "公网IP", value: showIp },
       { key: "配置", value: plan.plan_name || "-" },
       { key: "到期时间", value: expireAt }
@@ -615,11 +705,11 @@ function buildDetailView(kind, id, detailData, monitorData) {
       { key: "上行带宽", value: `${String(d.NetIn ?? plan.net_in ?? "-")} Mbps` },
       { key: "下行带宽", value: `${String(d.NetOut ?? plan.net_out ?? "-")} Mbps` },
       { key: "系统", value: d.OsInfo?.chinese_name || d.OsName || "-" },
-      { key: "可用区", value: d.Zone || "-" },
-      { key: "备份数量", value: `${String(rbsList.length)} 个` },
-      { key: "数据盘", value: `${String(eDiskList.length)} 个` },
-      { key: "IP数量", value: `${String(eipList.length)} 个` },
-      { key: "私有网络", value: `${String(vnets.length)} 个` }
+      { key: "线路", value: lineText },
+      { key: "备份数量", value: `${String(counts.rbs)} 个` },
+      { key: "数据盘", value: `${String(counts.eDisk)} 个` },
+      { key: "IP数量", value: `${String(counts.ipCount)} 个` },
+      { key: "私有网络", value: `${String(counts.vnetCount)} 个` }
     ];
     const monitorRows = [
       { key: "CPU(%)", value: usage.CPU === undefined ? "-" : Number(usage.CPU).toFixed(2) },
@@ -700,6 +790,108 @@ function buildDetailView(kind, id, detailData, monitorData) {
     return { baseInfo, serverInfo, configRows, monitorRows };
   }
 
+  if (kind === "rgs") {
+    const d = dataRoot || {};
+    const plan = d.Plan || d.plan || {};
+    const node = d.Node || d.node || {};
+    const usage = d.UsageData || d.usage_data || d.usage || {};
+    const natList = Array.isArray(detailEnvelope.NatList) ? detailEnvelope.NatList : (Array.isArray(d.NatList) ? d.NatList : []);
+    const counts = addonCounts(d);
+    const eipList = Array.isArray(detailEnvelope.EIPList) ? detailEnvelope.EIPList : (Array.isArray(d.EIPList) ? d.EIPList : []);
+    const ipv6 = eipList.find((x) => String(x.Type || "").toLowerCase().includes("ipv6"));
+    const showIp = (ipv6 && ipv6.IP) || d.NatPublicIP || d.MainIPv4 || d.IP || "-";
+    const subtype = String(plan.subtype || node.Subtype || d.Subtype || "").toLowerCase();
+    const isMcsm = subtype.includes("mcsm");
+    const eggType = d.EggType && typeof d.EggType === "object" ? d.EggType : {};
+    const eggMeta = eggType.egg && typeof eggType.egg === "object" ? eggType.egg : {};
+    const gameTitle = String(eggMeta.title || eggMeta.name || eggType.egg_name || d.EggTypeId || "-");
+    const accessHost = d.NatPublicDomain || d.NATSpareDomain || d.NatPublicIP || "-";
+    const natPorts = natList
+      .map((x) => {
+        const out = x && x.PortOut !== undefined ? String(x.PortOut) : "";
+        const type = x && x.PortType ? String(x.PortType) : "";
+        return out ? `${out}${type ? `/${type}` : ""}` : "";
+      })
+      .filter(Boolean)
+      .join(", ");
+    const displayName = isMcsm
+      ? String(pickFirstFieldDeep(d, ["McsmUserName", "EggType.egg.title", "EggType.egg_name"]) || `MCSM #${id}`)
+      : String(d.OsName || d.HostName || d.Name || "-");
+    const gameExpireRaw = pickFirstFieldDeep(d, ["ExpDate", "exp_date", "expired_at", "expire_at", "end_time", "due_time"]);
+    const gameExpireAt = formatDateTime(gameExpireRaw) || "-";
+    const lineText = String(plan.line || node.IpZone || d.Zone || node.Region || "-");
+    const baseInfo = [
+      { key: "产品类型", value: "游戏云" },
+      { key: "产品ID", value: String(id) },
+      { key: "名称", value: displayName },
+      { key: "状态", value: d.Status || "-" },
+      { key: "线路", value: lineText },
+      { key: "公网IP", value: isMcsm ? accessHost : showIp },
+      { key: "配置", value: plan.chinese || plan.plan_name || d.PlanName || d.Spec || "-" },
+      { key: "到期时间", value: gameExpireAt }
+    ];
+    const commonRows = [
+      { key: "CPU", value: `${String(d.CPU ?? plan.cpu ?? "-")} 核` },
+      { key: "内存", value: `${String(d.Memory ?? plan.memory ?? "-")} GB` },
+      { key: "系统盘", value: `${String(d.BaseDisk ?? d.Disk ?? plan.base_disk ?? plan.disk ?? "-")} GB` },
+      { key: "计费模式", value: getChargeTypeText(plan.charge_type || d.charge_type) },
+      { key: "电量", value: d.CpuPoint === undefined ? "-" : `${String(d.CpuPoint)} 点` },
+      { key: "上行带宽", value: `${String(d.NetIn ?? plan.net_in ?? "-")} Mbps` },
+      { key: "下行带宽", value: `${String(d.NetOut ?? plan.net_out ?? "-")} Mbps` },
+      { key: "备份数量", value: `${String(counts.rbs)} 个` },
+      { key: "数据盘", value: `${String(counts.eDisk)} 个` },
+      { key: "IP数量", value: `${String(counts.ipCount)} 个` },
+      { key: "私有网络", value: `${String(counts.vnetCount)} 个` }
+    ];
+    const configRows = isMcsm
+      ? [
+          ...commonRows,
+          { key: "接入地址", value: accessHost },
+          { key: "开放端口", value: natPorts || "-" },
+          { key: "游戏类型", value: String(gameTitle) },
+          { key: "运行镜像", value: String(eggType.mcsm_docker || eggType.docker || "-") },
+          { key: "面板账号", value: String(d.McsmUserName || d.McsmUser?.name || "-") },
+          { key: "实例UUID", value: String(d.ServerUUID || d.DaemonUUID || "-") },
+          { key: "线路", value: lineText }
+        ]
+      : [
+          ...commonRows,
+          { key: "系统", value: d.OsInfo?.chinese_name || d.OsName || "-" },
+          { key: "线路", value: lineText }
+        ];
+    const monitorRows = [
+      { key: "CPU(%)", value: usage.CPU === undefined ? "-" : Number(usage.CPU).toFixed(2) },
+      {
+        key: "内存使用",
+        value: usage.FreeMem !== undefined && usage.MaxMem !== undefined
+          ? `${formatBytes(Math.max(0, usage.MaxMem - usage.FreeMem))} / ${formatBytes(usage.MaxMem)}`
+          : (usage.memory_used !== undefined && usage.memory_total !== undefined
+            ? `${formatBytes(usage.memory_used)} / ${formatBytes(usage.memory_total)}`
+            : "-")
+      },
+      { key: "磁盘读速率", value: usage.DiskRead === undefined ? "-" : formatRate(usage.DiskRead) },
+      { key: "磁盘写速率", value: usage.DiskWrite === undefined ? "-" : formatRate(usage.DiskWrite) },
+      { key: "上行速率", value: usage.NetOut === undefined ? "-" : formatRate(usage.NetOut) },
+      { key: "下行速率", value: usage.NetIn === undefined ? "-" : formatRate(usage.NetIn) }
+    ];
+
+    const chargeType = String(plan.charge_type || d.charge_type || "").toLowerCase();
+    const hasTrafficBase = Number(plan.traffic_base_gb || d.traffic_base_gb || 0) > 0;
+    const hasTrafficPrice = !!((plan.traffic_price || d.traffic_price) && typeof (plan.traffic_price || d.traffic_price) === "object" && Object.keys(plan.traffic_price || d.traffic_price).length);
+    const isTrafficMetered = chargeType.includes("traffic") || hasTrafficBase || hasTrafficPrice;
+    const trafficBytes = d.TrafficBytes ?? d.traffic_bytes ?? d.TrafficLeft ?? d.traffic_left;
+    const serverInfo = {
+      id: String(d.ID || id),
+      tag: d.Tag && String(d.Tag).trim() ? String(d.Tag) : "未设定",
+      status: d.Status || "-",
+      node: node.ChineseName || d.Zone || node.Region || "-",
+      expireAt: gameExpireAt,
+      showTraffic: isTrafficMetered,
+      trafficLeft: trafficBytes !== undefined ? formatBytes(trafficBytes) : "-"
+    };
+    return { baseInfo, serverInfo, configRows, monitorRows };
+  }
+
   if (kind === "domain") {
     const d = dataRoot || {};
     const domainName = String(
@@ -773,7 +965,9 @@ function buildDetailView(kind, id, detailData, monitorData) {
 
   const keyMap = {
     rcs: ["cpu", "memory", "mem", "disk", "bandwidth", "os", "image", "traffic", "port"],
+    rgpu: ["cpu", "memory", "mem", "disk", "bandwidth", "os", "image", "traffic", "port"],
     rca: ["runtime", "cpu", "memory", "disk", "domain", "php", "region"],
+    rgs: ["cpu", "memory", "mem", "disk", "bandwidth", "os", "image", "traffic", "port"],
     domain: ["domain", "name", "status", "dns", "ns", "expired_at", "auto_renew", "lock"],
     ssl_order: ["common_name", "status", "brand", "cert_type", "expired_at"]
   };
@@ -935,10 +1129,16 @@ const HomePage = {
           <a-typography-text class="panel-subtext" type="secondary">数据来源 {{ source }}</a-typography-text>
         </div>
         <div class="entry-grid">
-          <button class="entry" @click="goList('rcs')"><i class="fa-solid fa-server"></i><span>云服务器</span><em>{{ summary.rcs.length }}</em></button>
-          <button class="entry" @click="goList('rca')"><i class="fa-solid fa-cloud"></i><span>云应用</span><em>{{ summary.rca.length }}</em></button>
-          <button class="entry" @click="goList('domain')"><i class="fa-solid fa-globe"></i><span>域名服务</span><em>{{ summary.domain.length }}</em></button>
-          <button class="entry" @click="goList('ssl_order')"><i class="fa-solid fa-key"></i><span>SSL证书</span><em>{{ summary.ssl_order.length }}</em></button>
+          <button class="entry" v-for="item in productEntries" :key="item.kind" @click="openEntry(item)">
+            <div class="entry-head">
+              <i :class="item.icon"></i>
+              <span>{{ item.label }}</span>
+            </div>
+            <div class="entry-meta">
+              <em>{{ item.count }}</em>
+              <small v-if="item.external">主站</small>
+            </div>
+          </button>
         </div>
       </section>
     </MobileShell>
@@ -946,12 +1146,43 @@ const HomePage = {
   setup() {
     const router = useRouter();
     const summary = computed(() => store.summary);
+    const overview = computed(() => (store.productOverview && typeof store.productOverview === "object" ? store.productOverview : {}));
     const profile = computed(() => store.userProfile || {});
     const rawData = computed(() => (store.rawSummary && store.rawSummary.data) ? store.rawSummary.data : {});
     const source = computed(() => store.summarySource || "--");
-    const productTotal = computed(() => summary.value.domain.length + summary.value.rca.length + summary.value.rcs.length + summary.value.ssl_order.length);
+    function idsCount(kind) {
+      const v = summary.value[kind];
+      return Array.isArray(v) ? v.length : 0;
+    }
+    function overviewCount(kind) {
+      const obj = overview.value && typeof overview.value === "object" ? overview.value[kind] : null;
+      if (obj === null || obj === undefined) return 0;
+      if (Array.isArray(obj)) return obj.length;
+      if (typeof obj === "object") {
+        const n = Number(obj.TotalCount ?? obj.total_count ?? obj.count ?? obj.total);
+        return Number.isFinite(n) ? Math.max(0, Math.floor(n)) : 0;
+      }
+      const n = Number(obj);
+      return Number.isFinite(n) ? Math.max(0, Math.floor(n)) : 0;
+    }
+    const productEntries = computed(() => {
+      const list = [
+        { kind: "rcs", label: "云服务器", icon: "fa-solid fa-server", route: "/product/rcs", external: false, count: Math.max(idsCount("rcs"), overviewCount("rcs")) },
+        { kind: "rgs", label: "游戏云", icon: "fa-solid fa-gamepad", route: "/product/rgs", external: false, count: Math.max(idsCount("rgs"), overviewCount("rgs")) },
+        { kind: "rca", label: "云应用", icon: "fa-solid fa-cloud", route: "/product/rca", external: false, count: Math.max(idsCount("rca"), overviewCount("rca")) },
+        { kind: "rgpu", label: "显卡云电脑", icon: "fa-solid fa-desktop", route: "/product/rgpu", external: false, count: Math.max(idsCount("rgpu"), overviewCount("rgpu")) },
+        { kind: "ros", label: "对象存储", icon: "fa-solid fa-database", route: "https://app.rainyun.com/apps/ros/list", external: true, count: overviewCount("ros") },
+        { kind: "rbm", label: "裸金属物理机", icon: "fa-solid fa-microchip", route: "https://app.rainyun.com/apps/rbm/list", external: true, count: overviewCount("rbm") },
+        { kind: "domain", label: "域名服务", icon: "fa-solid fa-globe", route: "/product/domain", external: false, count: Math.max(idsCount("domain"), overviewCount("domain")) },
+        { kind: "ssl_order", label: "SSL证书", icon: "fa-solid fa-key", route: "/product/ssl_order", external: false, count: Math.max(idsCount("ssl_order"), overviewCount("ssl")) },
+        { kind: "rvh", label: "虚拟主机", icon: "fa-solid fa-hard-drive", route: "https://app.rainyun.com/apps/rvh/list", external: true, count: overviewCount("rvh") },
+        { kind: "rshop", label: "软件商店", icon: "fa-solid fa-shop", route: "https://app.rainyun.com/apps/rshop/list", external: true, count: 0 }
+      ];
+      return list;
+    });
+    const productTotal = computed(() => productEntries.value.reduce((sum, item) => sum + Number(item.count || 0), 0));
     const tickets = computed(() => 0);
-    const renew = computed(() => summary.value.rcs.length + summary.value.rca.length);
+    const renew = computed(() => summary.value.rcs.length + summary.value.rgpu.length + summary.value.rgs.length + summary.value.rca.length);
     const coupons = computed(() => (Array.isArray(store.userCoupons) ? store.userCoupons.length : 0));
     const syncing = computed(() => store.loading);
     const lastSyncAt = computed(() => store.lastSyncAt);
@@ -982,6 +1213,16 @@ const HomePage = {
     ));
 
     const goList = (kind) => router.push(`/product/${kind}`);
+    const openEntry = (item) => {
+      if (!item) return;
+      if (item.external) {
+        window.open(String(item.route || "https://app.rainyun.com/apps"), "_blank");
+        return;
+      }
+      const k = String(item.kind || "");
+      if (!k) return;
+      goList(k);
+    };
     const goTodo = (type) => router.push(`/todo/${type}`);
     const refresh = () => refreshSummary(true);
     const openNews = (url) => {
@@ -992,7 +1233,7 @@ const HomePage = {
 
     onMounted(() => refreshSummary(false));
 
-    return { summary, source, productTotal, points, monthCost, balance, tickets, renew, coupons, syncing, lastSyncAt, activityNews, goList, goTodo, refresh, openNews };
+    return { summary, source, productTotal, points, monthCost, balance, tickets, renew, coupons, syncing, lastSyncAt, activityNews, productEntries, openEntry, goList, goTodo, refresh, openNews };
   }
 };
 
@@ -1092,6 +1333,7 @@ const TodoPage = {
       const n = Number(v);
       let d;
       if (Number.isFinite(n)) {
+        if (n <= 0) return { text: "-", daysText: "-", days: Number.POSITIVE_INFINITY };
         const ms = n > 1000000000000 ? n : (n > 1000000000 ? n * 1000 : n);
         d = new Date(ms);
       } else {
@@ -1106,6 +1348,8 @@ const TodoPage = {
 
     function endpointFor(kindName, productId) {
       if (kindName === "rcs") return `/product/rcs/${productId}/`;
+      if (kindName === "rgpu") return `/product/rcs/${productId}/`;
+      if (kindName === "rgs") return `/product/rgs/${productId}/`;
       if (kindName === "rca") return `/product/rca/project/${productId}/`;
       if (kindName === "domain") return `/product/domain/${productId}/`;
       return "";
@@ -1123,9 +1367,11 @@ const TodoPage = {
       }));
     }
 
-    async function tryGetRcsRenewPrice(id) {
+    async function tryGetRenewPrice(kindName, id) {
       try {
-        const p = await apiGet(`/product/rcs/price?scene=renew&product_id=${id}&duration=1&with_coupon_id=0&is_old=true`);
+        if (kindName !== "rcs" && kindName !== "rgpu" && kindName !== "rgs") return "";
+        const renewKind = kindName === "rgpu" ? "rcs" : kindName;
+        const p = await apiGet(`/product/${renewKind}/price?scene=renew&product_id=${id}&duration=1&with_coupon_id=0&is_old=true`);
         const d = extractPayloadData(p) || {};
         const v = pickFirstFieldDeep(d, ["price", "renew", "detail.per_scene.renew"]);
         const perScene = d.detail && d.detail.per_scene ? d.detail.per_scene : {};
@@ -1139,7 +1385,7 @@ const TodoPage = {
 
     async function loadRenews() {
       await refreshSummary(false);
-      const kinds = ["rcs", "rca", "domain"];
+      const kinds = ["rcs", "rgpu", "rgs", "rca", "domain"];
       const rows = [];
       const tasks = [];
       for (const kindName of kinds) {
@@ -1160,7 +1406,7 @@ const TodoPage = {
               const autoRaw = pickFirstFieldDeep(d, ["AutoRenew", "auto_renew", "expire_notice"]);
               const expRaw = pickFirstFieldDeep(d, ["ExpDate", "exp_date", "expired_at", "expire_at", "end_time", "due_time"]);
               const exp = parseExpire(expRaw);
-              const renewPrice = kindName === "rcs" ? await tryGetRcsRenewPrice(productId) : "";
+              const renewPrice = await tryGetRenewPrice(kindName, productId);
               return {
                 kind: kindName,
                 kindLabel: getKindLabel(kindName),
@@ -1191,6 +1437,7 @@ const TodoPage = {
       }
       await Promise.all(Array.from({ length: Math.min(concurrency, tasks.length) }, () => worker()));
       renewRows.value = rows
+        .filter((row) => Number.isFinite(row.days) && row.days <= 7)
         .sort((a, b) => a.days - b.days)
         .slice(0, 50);
     }
@@ -1351,7 +1598,14 @@ const ProductListPage = {
       window.prompt("复制ID列表", text);
     };
     const openMainSite = () => {
-      window.open("https://app.rainyun.com/", "_blank");
+      const kindName = String(kind.value || "");
+      const map = {
+        rgpu: "https://app.rainyun.com/apps/rgpu/list",
+        rcs: "https://app.rainyun.com/apps/rcs/list",
+        rgs: "https://app.rainyun.com/apps/rgs/list",
+        rca: "https://app.rainyun.com/apps/rca/list"
+      };
+      window.open(map[kindName] || "https://app.rainyun.com/", "_blank");
     };
     onMounted(() => refreshSummary(false));
     return { ids, kindLabel, viewIds, keyword, asc, openDetail, toggleSort, refresh, copyAllIds, openMainSite };
@@ -1372,10 +1626,10 @@ const ProductDetailPage = {
 
       <section class="panel" v-else>
         <div class="panel-title">
-          <a-typography-title :heading="6" class="typo-title">{{ kind === 'rcs' ? '服务器信息' : (kind === 'rca' ? '应用信息' : '基础状态') }}</a-typography-title>
+          <a-typography-title :heading="6" class="typo-title">{{ (kind === 'rcs' || kind === 'rgpu' || kind === 'rgs') ? '服务器信息' : (kind === 'rca' ? '应用信息' : '基础状态') }}</a-typography-title>
           <a-typography-text class="panel-subtext" type="secondary">{{ detailPath || '--' }}</a-typography-text>
         </div>
-        <div v-if="kind === 'rcs' || kind === 'rca'" class="server-info-list">
+        <div v-if="kind === 'rcs' || kind === 'rgpu' || kind === 'rgs' || kind === 'rca'" class="server-info-list">
           <div class="server-row"><span>{{ kind === 'rca' ? '项目 ID' : '服务器 ID' }}</span><b>{{ serverInfo.id }}</b></div>
           <div class="server-row"><span>标签</span><b>{{ serverInfo.tag }}</b></div>
           <div class="server-row">
@@ -1578,28 +1832,52 @@ const ProductDetailPage = {
       if (kindName === "rcs") {
         return {
           detail: `/product/rcs/${productId}/`,
-          monitor: `/product/rcs/${productId}/monitor`
+          monitor: `/product/rcs/${productId}/monitor`,
+          detailCandidates: [],
+          monitorCandidates: []
+        };
+      }
+      if (kindName === "rgpu") {
+        return {
+          detail: `/product/rcs/${productId}/`,
+          monitor: `/product/rcs/${productId}/monitor`,
+          detailCandidates: [],
+          monitorCandidates: []
+        };
+      }
+      if (kindName === "rgs") {
+        return {
+          detail: `/product/rgs/${productId}/`,
+          monitor: `/product/rgs/${productId}/monitor`,
+          detailCandidates: [`/product/rgs/game/${productId}/`, `/product/rgs/server/${productId}/`],
+          monitorCandidates: [`/product/rgs/${productId}/metrics`, `/product/rgs/game/${productId}/monitor`]
         };
       }
       if (kindName === "rca") {
         return {
           detail: `/product/rca/project/${productId}/`,
-          monitor: `/product/rca/project/${productId}/metrics`
+          monitor: `/product/rca/project/${productId}/metrics`,
+          detailCandidates: [],
+          monitorCandidates: []
         };
       }
       if (kindName === "domain") {
         return {
           detail: `/product/domain/${productId}/`,
-          monitor: ""
+          monitor: "",
+          detailCandidates: [],
+          monitorCandidates: []
         };
       }
       if (kindName === "ssl_order") {
         return {
           detail: "",
-          monitor: ""
+          monitor: "",
+          detailCandidates: [],
+          monitorCandidates: []
         };
       }
-      return { detail: "", monitor: "" };
+      return { detail: "", monitor: "", detailCandidates: [], monitorCandidates: [] };
     }
 
     async function loadDetail() {
@@ -1619,13 +1897,29 @@ const ProductDetailPage = {
         if (!endpoint.detail) {
           throw new Error("当前类型暂无详情接口映射");
         }
-        const detailPayload = await apiGet(endpoint.detail);
-        const detailData = extractPayloadData(detailPayload);
+        let detailData = {};
+        {
+          const detailPaths = [endpoint.detail, ...(endpoint.detailCandidates || [])].filter(Boolean);
+          let detailOk = false;
+          for (const p of detailPaths) {
+            try {
+              const detailPayload = await apiGet(p);
+              detailData = extractPayloadData(detailPayload);
+              detailPath.value = p;
+              detailOk = true;
+              break;
+            } catch {
+              // continue
+            }
+          }
+          if (!detailOk) throw new Error("详情接口请求失败");
+        }
         let monitorData = {};
         if (endpoint.monitor) {
           try {
             const tryPaths = [
               endpoint.monitor,
+              ...(endpoint.monitorCandidates || []),
               `${endpoint.monitor}?range=1h`,
               `${endpoint.monitor}?step=60`,
               `${endpoint.monitor}?type=basic`
@@ -1905,6 +2199,7 @@ const MePage = {
 
       <section class="panel me-stats">
         <div><b>{{ summary.rcs.length }}</b><span>云服务器</span></div>
+        <div><b>{{ summary.rgs.length }}</b><span>游戏云</span></div>
         <div><b>{{ summary.rca.length }}</b><span>云应用</span></div>
         <div><b>{{ summary.domain.length }}</b><span>域名</span></div>
         <div><b>{{ summary.ssl_order.length }}</b><span>证书</span></div>

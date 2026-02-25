@@ -102,6 +102,7 @@ npm run release:publish
 - `GITHUB_REPO` 支持 `owner/repo` 或完整 URL
 - 可选参数：`GITHUB_TAG_NAME`、`GITHUB_RELEASE_NAME`、`GITHUB_RELEASE_LATEST`（默认 `true`）
 - 默认 `GITHUB_TAG_NAME=release`，即持续更新同一个 Release
+- `RELEASE_NOTES` 留空时会自动使用最近提交信息生成发布说明
 
 ## `latest.json` 结构
 

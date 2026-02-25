@@ -7,13 +7,35 @@ import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 const ROOT = process.cwd();
 const ANDROID_DIR = path.join(ROOT, "android");
 const RELEASE_APK = path.join(ANDROID_DIR, "app", "build", "outputs", "apk", "release", "app-release.apk");
+const LOCAL_RELEASE_CONFIG_PATH = path.join(ROOT, "release.local.json");
+const LOCAL_RELEASE_CONFIG = readLocalReleaseConfig();
 
-function mustEnv(name) {
-  const v = process.env[name];
-  if (!v || !String(v).trim()) {
-    throw new Error(`缺少环境变量: ${name}`);
+function readLocalReleaseConfig() {
+  if (!fs.existsSync(LOCAL_RELEASE_CONFIG_PATH)) return {};
+  try {
+    const raw = fs.readFileSync(LOCAL_RELEASE_CONFIG_PATH, "utf8");
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch (e) {
+    throw new Error(`无法解析 release.local.json: ${String(e)}`);
   }
-  return String(v).trim();
+}
+
+function getConfig(name, options = {}) {
+  const required = Boolean(options.required);
+  const defaultValue = options.defaultValue ?? "";
+  const envValue = process.env[name];
+  if (envValue !== undefined && envValue !== null && String(envValue).trim()) {
+    return String(envValue).trim();
+  }
+  const localValue = LOCAL_RELEASE_CONFIG[name];
+  if (localValue !== undefined && localValue !== null && String(localValue).trim()) {
+    return String(localValue).trim();
+  }
+  if (required) {
+    throw new Error(`缺少配置: ${name}（请在环境变量或 release.local.json 中设置）`);
+  }
+  return String(defaultValue).trim();
 }
 
 function readVersionFromAppJs() {
@@ -29,6 +51,10 @@ function readVersionFromAppJs() {
 function run(cmd, cwd = ROOT) {
   console.log(`[run] ${cmd}`);
   execSync(cmd, { cwd, stdio: "inherit" });
+}
+
+function runCapture(cmd, cwd = ROOT) {
+  return execSync(cmd, { cwd, stdio: ["ignore", "pipe", "pipe"] }).toString("utf8").trim();
 }
 
 function hashSha256(filePath) {
@@ -102,6 +128,24 @@ function buildHistory(existingLatest, current, maxItems = 20) {
   add(existingLatest);
 
   return history.slice(0, maxItems);
+}
+
+function buildAutoReleaseNotes(version) {
+  try {
+    const raw = runCapture("git log --pretty=format:%s -n 8");
+    const lines = raw
+      .split(/\r?\n/)
+      .map((x) => x.trim())
+      .filter(Boolean)
+      .filter((x) => !/^merge\b/i.test(x))
+      .slice(0, 4);
+    if (!lines.length) {
+      return `${version} 发布版：自动打包并上传。`;
+    }
+    return `${version} 发布版：${lines.join("；")}。`;
+  } catch {
+    return `${version} 发布版：自动打包并上传。`;
+  }
 }
 
 async function uploadToS3({ endpoint, region, bucket, accessKeyId, secretAccessKey, forcePathStyle, key, filePath, contentType }) {
@@ -181,9 +225,9 @@ async function publishGitHubRelease({
   sha256,
   buildTime
 }) {
-  const tagName = process.env.GITHUB_TAG_NAME?.trim() || "release";
-  const releaseName = process.env.GITHUB_RELEASE_NAME?.trim() || `RainYun-App-v${version}-release`;
-  const makeLatest = String(process.env.GITHUB_RELEASE_LATEST || "true").toLowerCase() !== "false";
+  const tagName = getConfig("GITHUB_TAG_NAME", { defaultValue: "release" });
+  const releaseName = getConfig("GITHUB_RELEASE_NAME", { defaultValue: `RainYun-App-v${version}-release` });
+  const makeLatest = String(getConfig("GITHUB_RELEASE_LATEST", { defaultValue: "true" })).toLowerCase() !== "false";
   const body = `${version} 发布日志` + "\n\n" + `${releaseNotes}` + "\n\n" + `- sha256: ${sha256}` + "\n" + `- buildTime: ${buildTime}`;
 
   let release = null;
@@ -253,15 +297,16 @@ async function main() {
   const apkName = `RainYun-App-v${version}-release.apk`;
   const apkOut = path.join(ROOT, apkName);
 
-  const endpoint = mustEnv("S3_ENDPOINT");
-  const bucket = mustEnv("S3_BUCKET");
-  const accessKeyId = mustEnv("S3_ACCESS_KEY_ID");
-  const secretAccessKey = mustEnv("S3_SECRET_ACCESS_KEY");
-  const publicBaseUrl = mustEnv("PUBLIC_BASE_URL");
-  const region = process.env.S3_REGION?.trim() || "auto";
-  const forcePathStyle = String(process.env.S3_FORCE_PATH_STYLE || "true").toLowerCase() !== "false";
-  const prefix = normalizePrefix(process.env.S3_PREFIX || "app");
-  const releaseNotes = (process.env.RELEASE_NOTES || "").trim() || `${version} 发布版：自动打包并上传。`;
+  const endpoint = getConfig("S3_ENDPOINT", { required: true });
+  const bucket = getConfig("S3_BUCKET", { required: true });
+  const accessKeyId = getConfig("S3_ACCESS_KEY_ID", { required: true });
+  const secretAccessKey = getConfig("S3_SECRET_ACCESS_KEY", { required: true });
+  const publicBaseUrl = getConfig("PUBLIC_BASE_URL", { required: true });
+  const region = getConfig("S3_REGION", { defaultValue: "auto" });
+  const forcePathStyle = String(getConfig("S3_FORCE_PATH_STYLE", { defaultValue: "true" })).toLowerCase() !== "false";
+  const prefix = normalizePrefix(getConfig("S3_PREFIX", { defaultValue: "app" }));
+  const configuredReleaseNotes = getConfig("RELEASE_NOTES", { defaultValue: "" });
+  const releaseNotes = configuredReleaseNotes || buildAutoReleaseNotes(version);
 
   run("npm run cap:sync");
   const gradleCmd = process.platform === "win32" ? "gradlew.bat assembleRelease" : "./gradlew assembleRelease";
@@ -324,8 +369,8 @@ async function main() {
   console.log(`[done] downloadUrl=${downloadUrl}`);
   console.log(`[done] sha256=${sha256}`);
 
-  const githubToken = process.env.GITHUB_TOKEN?.trim() || "";
-  const githubRepoInput = process.env.GITHUB_REPO?.trim() || "";
+  const githubToken = getConfig("GITHUB_TOKEN", { defaultValue: "" });
+  const githubRepoInput = getConfig("GITHUB_REPO", { defaultValue: "" });
   if (githubToken && githubRepoInput) {
     const parsed = parseGitHubRepo(githubRepoInput);
     if (!parsed) {
