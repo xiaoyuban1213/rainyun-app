@@ -1,12 +1,13 @@
 # RainYun App Web
 
-RainYun 移动端风格 Web App（Vue 3 + Capacitor），支持本地调试、Android 打包、`latest.json` 在线更新检测和 S3 自动发布。
+RainYun 移动端风格 Web App（Vue 3 + Vite + Capacitor 8），支持本地调试、Android 打包、`latest.json` 在线更新检测和 S3 自动发布。
 
 ## 主要功能
 
 - 底部导航：`主页` / `推广中心` / `我的`（固定 Tab）
 - 主页：余额、积分、本月消费、代办事项、产品入口
 - 产品：列表与详情（基础状态、配置信息、监控信息）
+- 服务器详情：开关机/重启、VNC 打开、局部自动更新数据（不整页刷新）
 - 我的：账号信息、头像、API Key 管理、关于弹窗
 - 推广中心：推广数据、邀请链接、分享能力
 - 客户端更新：读取 `latest.json` 检测新版本并跳转下载
@@ -17,7 +18,9 @@ RainYun 移动端风格 Web App（Vue 3 + Capacitor），支持本地调试、An
 - `Vue Router 4`
 - `Arco Design Vue`
 - `Vite 5`
-- `Capacitor 7 (Android)`
+- `Capacitor 8 (Android)`
+- `Motion One`（动画）
+- `AWS SDK v3`（S3 发布上传）
 
 ## 环境要求
 
@@ -140,6 +143,11 @@ npm run release:publish
 - `scripts/release-publish.mjs`：发布与上传脚本
 - `latest.json`：更新源元数据
 - `android/`：Capacitor Android 工程
+
+## 刷新策略
+
+- 服务器详情页：启用局部自动更新（仅更新数据区，不整页重绘）
+- 其他页面：默认手动点击按钮刷新
 
 ## 安全与协作约定
 

@@ -1,11 +1,25 @@
 {
-  "version": "1.1.0",
-  "downloadUrl": "http://ros.yuban.cloud/app/RainYun-App-v1.1.0-release.apk",
-  "notes": "1. 优化api查询逻辑。\n2. 根据api分析推广中心每日收益。做个小的分析报表，可以用按钮弹窗的形式显示。\n3. 优化动画逻辑，引入动画库，让动画更流畅一些。\n4. 优化“我的”界面。\n5. 安卓各版本适配性优化。",
-  "sha256": "3959E46DD27D29434468302FC584E0134E8747DCE18BE99CCB62FD64394BB9C8",
-  "buildTime": "2026-02-28T09:20:23+08:00",
+  "version": "1.1.2",
+  "downloadUrl": "http://ros.yuban.cloud/app/RainYun-App-v1.1.2-release.apk",
+  "notes": "1. 修复 Android 12 部分机型底部 Tab 栏随页面滚动的问题。\n2. 增加视口高度兼容兜底，提升不同 WebView 版本下的底栏稳定性。\n3. 持续优化详情页数据刷新体验与界面一致性。",
+  "sha256": "68AE09D5A564D57F6C911C942711DDE551AB88297ED27A4B8DACE4C27465A70D",
+  "buildTime": "2026-02-28T16:49:56+08:00",
   "force": false,
   "history": [
+    {
+      "version": "1.1.2",
+      "notes": "1. 修复 Android 12 部分机型底部 Tab 栏随页面滚动的问题。\n2. 增加视口高度兼容兜底，提升不同 WebView 版本下的底栏稳定性。\n3. 持续优化详情页数据刷新体验与界面一致性。",
+      "buildTime": "2026-02-28T16:49:56+08:00",
+      "downloadUrl": "http://ros.yuban.cloud/app/RainYun-App-v1.1.2-release.apk",
+      "sha256": "68AE09D5A564D57F6C911C942711DDE551AB88297ED27A4B8DACE4C27465A70D"
+    },
+    {
+      "version": "1.1.1",
+      "notes": "1. 优化服务器详情页数据刷新策略：仅局部更新数据，减少卡顿与延迟。\n2. 自动更新仅保留在服务器详情页，其他页面保持手动刷新。\n3. 调整默认头像为本地白底灰色人像资源，避免外链依赖。\n4. 更新 Android 应用图标并补全多密度图标资源。\n5. 更新关于页技术栈与 README 文档，完善 1.1.1 发布准备。",
+      "buildTime": "2026-02-28T16:34:27+08:00",
+      "downloadUrl": "http://ros.yuban.cloud/app/RainYun-App-v1.1.1-release.apk",
+      "sha256": "7E18269AEE2765C24EA9E16D646338F6E8DA6A9411EC20457D04D5CF666E6170"
+    },
     {
       "version": "1.1.0",
       "notes": "1. 优化api查询逻辑。\n2. 根据api分析推广中心每日收益。做个小的分析报表，可以用按钮弹窗的形式显示。\n3. 优化动画逻辑，引入动画库，让动画更流畅一些。\n4. 优化“我的”界面。\n5. 安卓各版本适配性优化。",

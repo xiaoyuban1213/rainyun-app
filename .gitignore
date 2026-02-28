@@ -35,6 +35,9 @@ android/keystore.properties
 android/**/build/
 android/captures/
 tmp_*/
+tmp_*.html
+tmp_*.js
+tmp_*.txt
 
 # editors / OS
 .idea/

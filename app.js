@@ -1,4 +1,4 @@
-import { createApp, reactive, computed, ref, onMounted, watch } from "vue";
+import { createApp, reactive, computed, ref, onMounted, onUnmounted, watch } from "vue";
 import { createRouter, createWebHashHistory, useRouter, useRoute } from "vue-router";
 import { Capacitor } from "@capacitor/core";
 import { animate } from "@motionone/dom";
@@ -12,11 +12,18 @@ import "@arco-design/web-vue/es/tag/style/css.js";
 import "@arco-design/web-vue/es/typography/style/css.js";
 
 const BRAND_LOGO = "https://cdn.apifox.com/app/project-icon/custom/20231116/e416b172-004f-452f-8090-8e85991f422c.png";
-const AVATAR = "https://i.pravatar.cc/120?img=32";
-const APP_VERSION = "1.1.0";
+const AVATAR = new URL("./assets/images/default-avatar.svg", import.meta.url).href;
+const APP_VERSION = "1.1.2";
 const UPDATE_BASE_URL = "http://ros.yuban.cloud/app";
 const UPDATE_FEED_URL = `${UPDATE_BASE_URL}/latest.json`;
+const DETAIL_AUTO_REFRESH_MS = 6000;
 let navOriginTrackerInited = false;
+
+function syncAppViewportHeight() {
+  if (typeof window === "undefined" || typeof document === "undefined") return;
+  const vh = window.innerHeight * 0.01;
+  document.documentElement.style.setProperty("--app-vh", `${vh}px`);
+}
 
 function setNavOrigin(clientX, clientY) {
   if (typeof document === "undefined") return;
@@ -2297,6 +2304,26 @@ const ProductDetailPage = {
           <div class="server-row"><span>到期日期</span><b>{{ serverInfo.expireAt }}</b></div>
           <div class="server-row" v-if="serverInfo.showTraffic"><span>剩余流量</span><b>{{ serverInfo.trafficLeft }}</b></div>
         </div>
+        <div v-if="canOperatePower" class="detail-quick-actions">
+          <div class="panel-title mini">
+            <a-typography-title :heading="6" class="typo-title">快速操作</a-typography-title>
+            <a-typography-text class="panel-subtext" type="secondary">服务器控制与远程连接</a-typography-text>
+          </div>
+          <div class="action-grid quick-actions-grid">
+            <a-button class="line-btn" size="medium" type="outline" @click="copyProductId">复制ID</a-button>
+            <a-button class="line-btn" size="medium" type="outline" @click="startServer">开机</a-button>
+            <a-button class="line-btn" size="medium" type="outline" @click="rebootServer">重启</a-button>
+            <a-button class="line-btn" size="medium" type="outline" @click="stopServer">关机</a-button>
+            <a-button class="line-btn" size="medium" type="outline" :disabled="vncLoading" @click="openVnc('xtermjs')">Xtermjs</a-button>
+            <a-button class="line-btn" size="medium" type="outline" :disabled="vncLoading" @click="openVnc('novnc')">NoVNC</a-button>
+          </div>
+          <div v-if="vncLoading" class="vnc-loading-tip">正在获取 VNC 地址...</div>
+          <div v-if="opLoading" class="vnc-loading-tip">正在执行操作...</div>
+          <div v-if="opErrorText" class="vnc-loading-tip is-error">{{ opErrorText }}</div>
+          <div v-if="opApiPath" class="detail-op-path">
+            <a-typography-text class="panel-subtext" type="secondary">控制接口：{{ opApiPath }}</a-typography-text>
+          </div>
+        </div>
         <div v-else class="detail-metrics">
           <div class="metric-item" v-for="row in baseInfo" :key="'base-' + row.key">
             <span>{{ row.key }}</span>
@@ -2335,8 +2362,23 @@ const ProductDetailPage = {
       </section>
 
       <section class="panel action-grid">
+        <a-button class="line-btn" size="medium" type="outline" @click="goList">返回列表</a-button>
         <a-button class="line-btn" size="medium" type="outline" @click="loadDetail">刷新数据</a-button>
+        <a-typography-text class="panel-subtext detail-auto-refresh-text" type="secondary">{{ autoRefreshText }}</a-typography-text>
       </section>
+
+      <div v-if="vncShow" class="vnc-modal-mask" @click.self="closeVnc">
+        <div class="vnc-modal">
+          <div class="vnc-modal-head">
+            <b>VNC 远程连接</b>
+            <button class="vnc-close" @click="closeVnc">×</button>
+          </div>
+          <div class="vnc-modal-body">
+            <iframe v-if="vncUrl" :src="vncUrl" frameborder="0" allowfullscreen></iframe>
+            <a-typography-text v-else type="secondary" class="muted">正在建立连接...</a-typography-text>
+          </div>
+        </div>
+      </div>
     </MobileShell>
   `,
   setup() {
@@ -2374,6 +2416,21 @@ const ProductDetailPage = {
     const monitorRows = ref([]);
     const detailPath = ref("");
     const monitorPath = ref("");
+    const opLoading = ref(false);
+    const opErrorText = ref("");
+    const opApiPath = ref("");
+    const vncShow = ref(false);
+    const vncLoading = ref(false);
+    const vncUrl = ref("");
+    const autoRefreshAt = ref("");
+    const detailRefreshing = ref(false);
+    let detailAutoRefreshTimer = null;
+    const canOperatePower = computed(() => kind.value === "rcs" || kind.value === "rgpu");
+    const autoRefreshText = computed(() => {
+      const base = `自动更新：每 ${Math.floor(DETAIL_AUTO_REFRESH_MS / 1000)} 秒`;
+      if (!autoRefreshAt.value) return base;
+      return `${base}（上次 ${autoRefreshAt.value}）`;
+    });
     function parseSizeToBytes(num, unit) {
       const n = Number(num);
       if (!Number.isFinite(n)) return null;
@@ -2535,14 +2592,21 @@ const ProductDetailPage = {
       return { detail: "", monitor: "", detailCandidates: [], monitorCandidates: [] };
     }
 
-    async function loadDetail() {
-      await refreshSummary(false);
-      loading.value = true;
-      errorText.value = "";
-      baseInfo.value = [];
-      serverInfo.value = { id: "-", tag: "未设定", status: "-", node: "-", expireAt: "-", showTraffic: false, trafficLeft: "-" };
-      configRows.value = [];
-      monitorRows.value = [];
+    async function loadDetailCore(options = {}) {
+      const silent = Boolean(options.silent);
+      const force = Boolean(options.force);
+      if (detailRefreshing.value) return false;
+      detailRefreshing.value = true;
+      const requestOptions = force ? { force: true, ttlMs: 0 } : (silent ? { ttlMs: 3000 } : {});
+      if (!silent) {
+        loading.value = true;
+        errorText.value = "";
+        opErrorText.value = "";
+        baseInfo.value = [];
+        serverInfo.value = { id: "-", tag: "未设定", status: "-", node: "-", expireAt: "-", showTraffic: false, trafficLeft: "-" };
+        configRows.value = [];
+        monitorRows.value = [];
+      }
 
       const endpoint = endpointFor(kind.value, id.value);
       detailPath.value = endpoint.detail;
@@ -2558,7 +2622,7 @@ const ProductDetailPage = {
           let detailOk = false;
           for (const p of detailPaths) {
             try {
-              const detailPayload = await apiGet(p);
+              const detailPayload = await apiGet(p, requestOptions);
               detailData = extractPayloadData(detailPayload);
               detailPath.value = p;
               detailOk = true;
@@ -2582,7 +2646,7 @@ const ProductDetailPage = {
             let ok = false;
             for (const p of tryPaths) {
               try {
-                const monitorPayload = await apiGet(p);
+                const monitorPayload = await apiGet(p, requestOptions);
                 monitorData = extractPayloadData(monitorPayload);
                 monitorPath.value = p;
                 ok = true;
@@ -2606,14 +2670,178 @@ const ProductDetailPage = {
           monitorRows.value = view.monitorRows;
         }
       } catch (e) {
-        errorText.value = String(e);
+        if (silent) {
+          reportLog("WARN", "detail_auto_refresh_error", { kind: kind.value, id: id.value, error: String(e) });
+        } else {
+          errorText.value = String(e);
+        }
       } finally {
-        loading.value = false;
+        if (!silent) {
+          loading.value = false;
+        }
+        detailRefreshing.value = false;
       }
+      return true;
+    }
+
+    async function loadDetail() {
+      await loadDetailCore({ silent: false, force: false });
     }
 
     function goList() {
       router.push(`/product/${kind.value}`);
+    }
+
+    function canAutoRefreshNow() {
+      if (loading.value || opLoading.value || vncLoading.value || vncShow.value || detailRefreshing.value) return false;
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") return false;
+      return true;
+    }
+
+    async function autoRefreshDetail() {
+      if (!canAutoRefreshNow()) return;
+      const refreshed = await loadDetailCore({ silent: true, force: false });
+      if (refreshed) {
+        autoRefreshAt.value = new Date().toLocaleTimeString("zh-CN", { hour12: false });
+      }
+    }
+
+    function startDetailAutoRefresh() {
+      if (detailAutoRefreshTimer) clearInterval(detailAutoRefreshTimer);
+      detailAutoRefreshTimer = setInterval(() => {
+        autoRefreshDetail();
+      }, DETAIL_AUTO_REFRESH_MS);
+    }
+
+    function stopDetailAutoRefresh() {
+      if (!detailAutoRefreshTimer) return;
+      clearInterval(detailAutoRefreshTimer);
+      detailAutoRefreshTimer = null;
+    }
+
+    function onPageVisibilityChange() {
+      if (typeof document === "undefined") return;
+      if (document.visibilityState === "visible") {
+        autoRefreshDetail();
+      }
+    }
+
+    async function copyProductId() {
+      const text = String(id.value || "").trim();
+      if (!text) {
+        toast("暂无可复制ID");
+        return;
+      }
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(text);
+          toast("产品ID已复制");
+          return;
+        }
+      } catch {
+        // ignore
+      }
+      window.prompt("复制产品ID", text);
+    }
+
+    function controlPath(action) {
+      const productId = String(id.value || "").trim();
+      if (!productId) return "";
+      if (!canOperatePower.value) return "";
+      if (action === "start") return `/product/rcs/${productId}/start`;
+      if (action === "reboot") return `/product/rcs/${productId}/reboot`;
+      if (action === "stop") return `/product/rcs/${productId}/stop`;
+      return "";
+    }
+
+    async function runControl(action, tipText) {
+      const path = controlPath(action);
+      if (!path) {
+        toast("当前类型暂不支持该操作");
+        return;
+      }
+      const actionMap = { start: "开机", reboot: "重启", stop: "关机" };
+      const ok = window.confirm(`确认${actionMap[action] || "执行"}该服务器吗？`);
+      if (!ok) return;
+      opLoading.value = true;
+      opErrorText.value = "";
+      opApiPath.value = path;
+      try {
+        await apiRequest("POST", path);
+        toast(tipText);
+        await loadDetail();
+      } catch (e) {
+        const msg = String(e || "unknown");
+        opErrorText.value = msg;
+        toast(`操作失败：${msg}`);
+      } finally {
+        opLoading.value = false;
+      }
+    }
+
+    async function startServer() {
+      await runControl("start", "开机请求已提交");
+    }
+
+    async function rebootServer() {
+      await runControl("reboot", "重启请求已提交");
+    }
+
+    async function stopServer() {
+      await runControl("stop", "关机请求已提交");
+    }
+
+    async function postFormUrl(url, payload) {
+      const body = new URLSearchParams();
+      Object.entries(payload || {}).forEach(([k, v]) => body.set(String(k), String(v ?? "")));
+      const res = await fetch(String(url), {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: body.toString()
+      });
+      return res;
+    }
+
+    async function openVnc(mode) {
+      if (!canOperatePower.value) {
+        toast("当前类型暂不支持 VNC");
+        return;
+      }
+      const productId = String(id.value || "").trim();
+      if (!productId) {
+        toast("产品ID无效");
+        return;
+      }
+      const safeMode = mode === "novnc" ? "novnc" : "xtermjs";
+      const path = `/product/rcs/${productId}/vnc?console_type=${encodeURIComponent(safeMode)}`;
+      vncLoading.value = true;
+      opApiPath.value = path;
+      opErrorText.value = "";
+      try {
+        const payload = await apiGet(path, { force: true, ttlMs: 0 });
+        const d = extractPayloadData(payload) || {};
+        let targetUrl = String(d.VNCProxyURL || d.RedirectURL || "").trim();
+        if (!targetUrl && d.RequestURL) {
+          await postFormUrl(d.RequestURL, { pveauth: d.PVEAuth || "", redurl: d.RedirectURL || "" });
+          targetUrl = String(d.RedirectURL || "").trim();
+        }
+        if (!targetUrl) {
+          throw new Error("未获取到 VNC 地址");
+        }
+        vncUrl.value = toAbsoluteUrl(targetUrl, normalizeBaseUrl(store.auth.baseUrl));
+        vncShow.value = true;
+      } catch (e) {
+        const msg = String(e || "unknown");
+        opErrorText.value = msg;
+        toast(`VNC 打开失败：${msg}`);
+      } finally {
+        vncLoading.value = false;
+      }
+    }
+
+    function closeVnc() {
+      vncShow.value = false;
+      vncUrl.value = "";
     }
 
     function monitorLabel(rawKey) {
@@ -2624,6 +2852,16 @@ const ProductDetailPage = {
 
     onMounted(() => {
       loadDetail();
+      startDetailAutoRefresh();
+      if (typeof document !== "undefined") {
+        document.addEventListener("visibilitychange", onPageVisibilityChange, { passive: true });
+      }
+    });
+    onUnmounted(() => {
+      stopDetailAutoRefresh();
+      if (typeof document !== "undefined") {
+        document.removeEventListener("visibilitychange", onPageVisibilityChange);
+      }
     });
 
     return {
@@ -2642,7 +2880,21 @@ const ProductDetailPage = {
       monitorPath,
       monitorLabel,
       loadDetail,
-      goList
+      goList,
+      canOperatePower,
+      copyProductId,
+      startServer,
+      rebootServer,
+      stopServer,
+      openVnc,
+      closeVnc,
+      vncShow,
+      vncLoading,
+      vncUrl,
+      opLoading,
+      opErrorText,
+      opApiPath,
+      autoRefreshText
     };
   }
 };
@@ -2870,22 +3122,54 @@ const PromoPage = {
         AVATAR
       );
     });
+    function isShareCancelError(error) {
+      const msg = String(error || "").toLowerCase();
+      return (
+        msg.includes("cancel") ||
+        msg.includes("canceled") ||
+        msg.includes("abort") ||
+        msg.includes("dismiss") ||
+        msg.includes("denied")
+      );
+    }
+    async function copyTextSafely(text) {
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(text);
+          return true;
+        }
+      } catch {
+        // try legacy fallback
+      }
+      try {
+        const el = document.createElement("textarea");
+        el.value = text;
+        el.setAttribute("readonly", "readonly");
+        el.style.position = "fixed";
+        el.style.opacity = "0";
+        el.style.left = "-9999px";
+        document.body.appendChild(el);
+        el.focus();
+        el.select();
+        const ok = document.execCommand("copy");
+        document.body.removeChild(el);
+        return Boolean(ok);
+      } catch {
+        return false;
+      }
+    }
     async function copyLink() {
       const link = promo.value.link;
       if (!link || link.endsWith("/")) {
         toast("暂无可用推广码");
         return;
       }
-      try {
-        if (navigator.clipboard && navigator.clipboard.writeText) {
-          await navigator.clipboard.writeText(link);
-          toast("推广链接已复制");
-          return;
-        }
-      } catch {
-        // fallback below
+      const ok = await copyTextSafely(link);
+      if (ok) {
+        toast("推广链接已复制");
+      } else {
+        toast("复制失败，请长按链接手动复制");
       }
-      window.prompt("复制推广链接", link);
     }
     function openLink() {
       const link = promo.value.link;
@@ -2908,10 +3192,12 @@ const PromoPage = {
           await Share.share({
             title: "雨云推广链接",
             text: `通过我的邀请码注册雨云：${link}`,
+            url: link,
             dialogTitle: "分享邀请链接"
           });
           return;
         } catch (e) {
+          if (isShareCancelError(e)) return;
           reportLog("WARN", "native_share_error", { error: String(e) });
         }
       }
@@ -2919,8 +3205,9 @@ const PromoPage = {
         try {
           await navigator.share({ title: "雨云推广链接", text: "通过我的邀请码注册雨云", url: link });
           return;
-        } catch {
-          // fallback copy
+        } catch (e) {
+          if (isShareCancelError(e)) return;
+          reportLog("WARN", "web_share_error", { error: String(e) });
         }
       }
       await copyLink();
@@ -3035,10 +3322,12 @@ const PromoPage = {
 const LoginPage = {
   components: { MobileShell },
   template: `
-    <MobileShell title="登录">
+    <MobileShell :title="isEditMode ? '编辑 API Key' : '登录'">
       <section class="panel login-hero">
-        <a-typography-title :heading="5" class="typo-title">API Key 登录</a-typography-title>
-        <a-typography-text class="panel-subtext" type="secondary">仅需输入 API Key 即可完成登录。</a-typography-text>
+        <a-typography-title :heading="5" class="typo-title">{{ isEditMode ? '编辑 API Key' : 'API Key 登录' }}</a-typography-title>
+        <a-typography-text class="panel-subtext" type="secondary">
+          {{ isEditMode ? '修改后将立即重新同步账号数据。' : '仅需输入 API Key 即可完成登录。' }}
+        </a-typography-text>
       </section>
 
       <section class="panel login-panel">
@@ -3048,14 +3337,16 @@ const LoginPage = {
           </label>
         </div>
         <div class="btn-row">
-          <a-button class="primary-btn" type="primary" :loading="loading" @click="submitLogin">保存并同步</a-button>
+          <a-button class="primary-btn" type="primary" :loading="loading" @click="submitLogin">{{ isEditMode ? '更新并同步' : '保存并同步' }}</a-button>
         </div>
       </section>
     </MobileShell>
   `,
   setup() {
     const router = useRouter();
+    const route = useRoute();
     const loading = ref(false);
+    const isEditMode = computed(() => String(route.query?.edit || "") === "1");
     const form = reactive({
       apiKey: store.auth.apiKey || ""
     });
@@ -3078,8 +3369,13 @@ const LoginPage = {
           account: ""
         });
         await refreshSummary(true);
-        toast("登录成功");
-        router.replace("/home");
+        if (isEditMode.value) {
+          toast("API Key 已更新");
+          router.replace("/me");
+        } else {
+          toast("登录成功");
+          router.replace("/home");
+        }
       } catch (e) {
         toast(`登录失败：${String(e || "")}`);
       } finally {
@@ -3088,10 +3384,10 @@ const LoginPage = {
     }
 
     onMounted(() => {
-      if (isAuthenticated()) router.replace("/home");
+      if (isAuthenticated() && !isEditMode.value) router.replace("/home");
     });
 
-    return { form, loading, submitLogin };
+    return { form, loading, submitLogin, isEditMode };
   }
 };
 
@@ -3158,7 +3454,9 @@ const MePage = {
               <a-tag size="small" color="cyan">Vue Router 4</a-tag>
               <a-tag size="small" color="blue">Arco Design Vue</a-tag>
               <a-tag size="small" color="green">Vite 5</a-tag>
-              <a-tag size="small" color="purple">Capacitor 7</a-tag>
+              <a-tag size="small" color="purple">Capacitor 8</a-tag>
+              <a-tag size="small" color="orangered">Motion One</a-tag>
+              <a-tag size="small" color="gold">AWS SDK v3</a-tag>
             </div>
           </section>
           <section class="about-section">
@@ -3217,7 +3515,7 @@ const MePage = {
       const masked = raw ? `${raw.slice(0, 3)}***${raw.slice(-3)}` : "-";
       return { modeText: "API Key", masked };
     });
-    const goLogin = () => router.push("/login");
+    const goLogin = () => router.push("/login?edit=1");
     const logout = () => {
       saveAuth({ baseUrl: store.auth.baseUrl, apiKey: "", devToken: "", authMode: "apiKey", account: "" });
       store.userProfile = null;
@@ -3467,6 +3765,11 @@ const RootApp = {
     };
 
     onMounted(() => {
+      syncAppViewportHeight();
+      if (typeof window !== "undefined") {
+        window.addEventListener("resize", syncAppViewportHeight, { passive: true });
+        window.addEventListener("orientationchange", syncAppViewportHeight, { passive: true });
+      }
       bootStartAt = Date.now();
       bootExpectedMs.value = readBootMetrics().emaMs || BOOT_EXPECTED_FALLBACK_MS;
       if (typeof window !== "undefined" && window.matchMedia) {
@@ -3494,6 +3797,13 @@ const RootApp = {
       }
     });
 
+    onUnmounted(() => {
+      if (typeof window !== "undefined") {
+        window.removeEventListener("resize", syncAppViewportHeight);
+        window.removeEventListener("orientationchange", syncAppViewportHeight);
+      }
+    });
+
     return { loading, bootVisible, bootProgress, bootMode, logo: BRAND_LOGO, onBootEnter, onBootLeave, onPageEnter, onPageLeave };
   }
 };
@@ -3503,7 +3813,7 @@ router.beforeEach((to) => {
     toast("请先登录");
     return "/login";
   }
-  if (isAuthenticated() && to.path === "/login") {
+  if (isAuthenticated() && to.path === "/login" && String(to.query?.edit || "") !== "1") {
     return "/home";
   }
   return true;
