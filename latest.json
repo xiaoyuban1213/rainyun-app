@@ -1,14 +1,21 @@
 {
-  "version": "1.0.10",
-  "downloadUrl": "http://ros.yuban.cloud/app/RainYun-App-v1.0.10-release.apk",
-  "notes": "优化待续费逻辑。",
-  "sha256": "BA133E0C71CE43C9FED0720242FCA0DDA65945A9AAAFB1D0F4186A40848B779A",
-  "buildTime": "2026-02-25T16:49:26+08:00",
+  "version": "1.1.0",
+  "downloadUrl": "http://ros.yuban.cloud/app/RainYun-App-v1.1.0-release.apk",
+  "notes": "1. 优化api查询逻辑。\n2. 根据api分析推广中心每日收益。做个小的分析报表，可以用按钮弹窗的形式显示。\n3. 优化动画逻辑，引入动画库，让动画更流畅一些。\n4. 优化“我的”界面。\n5. 安卓各版本适配性优化。",
+  "sha256": "3959E46DD27D29434468302FC584E0134E8747DCE18BE99CCB62FD64394BB9C8",
+  "buildTime": "2026-02-28T09:20:23+08:00",
   "force": false,
   "history": [
     {
+      "version": "1.1.0",
+      "notes": "1. 优化api查询逻辑。\n2. 根据api分析推广中心每日收益。做个小的分析报表，可以用按钮弹窗的形式显示。\n3. 优化动画逻辑，引入动画库，让动画更流畅一些。\n4. 优化“我的”界面。\n5. 安卓各版本适配性优化。",
+      "buildTime": "2026-02-28T09:20:23+08:00",
+      "downloadUrl": "http://ros.yuban.cloud/app/RainYun-App-v1.1.0-release.apk",
+      "sha256": "3959E46DD27D29434468302FC584E0134E8747DCE18BE99CCB62FD64394BB9C8"
+    },
+    {
       "version": "1.0.10",
-      "notes": "优化待续费逻辑。",
+      "notes": "优化待续费逻辑。,提升安卓新版本系统栏与开屏兼容。,更新检查弹窗支持多行更新日志。",
       "buildTime": "2026-02-25T16:49:26+08:00",
       "downloadUrl": "http://ros.yuban.cloud/app/RainYun-App-v1.0.10-release.apk",
       "sha256": "BA133E0C71CE43C9FED0720242FCA0DDA65945A9AAAFB1D0F4186A40848B779A"

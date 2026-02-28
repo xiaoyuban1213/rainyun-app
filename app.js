@@ -1,6 +1,7 @@
 import { createApp, reactive, computed, ref, onMounted, watch } from "vue";
 import { createRouter, createWebHashHistory, useRouter, useRoute } from "vue-router";
 import { Capacitor } from "@capacitor/core";
+import { animate } from "@motionone/dom";
 import AButton from "@arco-design/web-vue/es/button";
 import AInput from "@arco-design/web-vue/es/input";
 import ATag from "@arco-design/web-vue/es/tag";
@@ -12,7 +13,7 @@ import "@arco-design/web-vue/es/typography/style/css.js";
 
 const BRAND_LOGO = "https://cdn.apifox.com/app/project-icon/custom/20231116/e416b172-004f-452f-8090-8e85991f422c.png";
 const AVATAR = "https://i.pravatar.cc/120?img=32";
-const APP_VERSION = "1.0.10";
+const APP_VERSION = "1.1.0";
 const UPDATE_BASE_URL = "http://ros.yuban.cloud/app";
 const UPDATE_FEED_URL = `${UPDATE_BASE_URL}/latest.json`;
 let navOriginTrackerInited = false;
@@ -73,18 +74,38 @@ const store = reactive({
   summary: { domain: [], rca: [], rcs: [], rgpu: [], rgs: [], ssl_order: [] },
   renewDueCount: 0,
   renewDueRows: [],
+  renewDueAt: 0,
+  renewDuePriceAt: 0,
   productOverview: null,
   summarySource: "",
   rawSummary: null,
   userProfile: null,
   userCoupons: [],
+  userCouponsAt: 0,
   homeNews: [],
   lastSyncAt: ""
 });
 let summaryInflightPromise = null;
+let renewPriceInflightPromise = null;
+let couponInflightPromise = null;
 const apiGetCache = new Map();
 const apiGetInflight = new Map();
 const API_GET_DEFAULT_TTL = 8000;
+const RENEW_ROWS_TTL_MS = 60 * 1000;
+const RENEW_PRICE_TTL_MS = 2 * 60 * 1000;
+const COUPON_TTL_MS = 60 * 1000;
+const API_REQUEST_CACHE_KEY = "rainyun-api-request-cache";
+const PROMO_DAILY_CACHE_KEY = "rainyun-promo-income-daily-cache";
+const API_REQUEST_CACHE_LIMIT = 240;
+const PROMO_DAILY_CACHE_LIMIT = 180;
+const BOOT_METRICS_KEY = "rainyun-boot-metrics-v1";
+const BOOT_EXPECTED_FALLBACK_MS = 2600;
+const BOOT_EXPECTED_MIN_MS = 1200;
+const BOOT_EXPECTED_MAX_MS = 6500;
+const BOOT_MIN_VISIBLE_MS = 700;
+const BOOT_EMA_ALPHA = 0.35;
+const AUTH_LOGIN_PATHS = ["/user/login", "/auth/login", "/login", "/account/login"];
+const TENCENT_CAPTCHA_APP_ID = "2039519451";
 
 function toast(msg) {
   const el = document.getElementById("toast");
@@ -107,17 +128,26 @@ function reportLog(level, event, detail = {}) {
 }
 
 function loadAuth() {
+  const defaultAuth = {
+    baseUrl: "https://api.v2.rainyun.com",
+    apiKey: "",
+    devToken: "",
+    authMode: "apiKey",
+    account: ""
+  };
   try {
     const raw = localStorage.getItem("rainyun-auth");
-    if (!raw) return { baseUrl: "https://api.v2.rainyun.com", apiKey: "", devToken: "" };
+    if (!raw) return defaultAuth;
     const v = JSON.parse(raw);
     return {
-      baseUrl: v.baseUrl || "https://api.v2.rainyun.com",
+      baseUrl: v.baseUrl || defaultAuth.baseUrl,
       apiKey: v.apiKey || "",
-      devToken: v.devToken || ""
+      devToken: v.devToken || "",
+      authMode: v.authMode === "account" ? "account" : "apiKey",
+      account: v.account || ""
     };
   } catch {
-    return { baseUrl: "https://api.v2.rainyun.com", apiKey: "", devToken: "" };
+    return defaultAuth;
   }
 }
 
@@ -125,12 +155,292 @@ function saveAuth(nextAuth) {
   store.auth = {
     baseUrl: (nextAuth.baseUrl || "https://api.v2.rainyun.com").trim(),
     apiKey: (nextAuth.apiKey || "").trim(),
-    devToken: (nextAuth.devToken || "").trim()
+    devToken: (nextAuth.devToken || "").trim(),
+    authMode: nextAuth.authMode === "account" ? "account" : "apiKey",
+    account: (nextAuth.account || "").trim()
   };
   localStorage.setItem("rainyun-auth", JSON.stringify(store.auth));
   apiGetCache.clear();
   apiGetInflight.clear();
+  store.renewDueRows = [];
+  store.renewDueCount = 0;
+  store.renewDueAt = 0;
+  store.renewDuePriceAt = 0;
+  store.userCoupons = [];
+  store.userCouponsAt = 0;
   reportLog("INFO", "auth_saved", { hasApiKey: Boolean(store.auth.apiKey), hasDevToken: Boolean(store.auth.devToken) });
+}
+
+function clamp(n, min, max) {
+  return Math.max(min, Math.min(max, n));
+}
+
+function readBootMetrics() {
+  try {
+    const raw = localStorage.getItem(BOOT_METRICS_KEY);
+    if (!raw) return { emaMs: BOOT_EXPECTED_FALLBACK_MS, samples: 0, lastMs: BOOT_EXPECTED_FALLBACK_MS };
+    const parsed = JSON.parse(raw);
+    const emaMs = Number(parsed?.emaMs);
+    const samples = Number(parsed?.samples);
+    const lastMs = Number(parsed?.lastMs);
+    return {
+      emaMs: Number.isFinite(emaMs) ? clamp(emaMs, BOOT_EXPECTED_MIN_MS, BOOT_EXPECTED_MAX_MS) : BOOT_EXPECTED_FALLBACK_MS,
+      samples: Number.isFinite(samples) ? Math.max(0, Math.floor(samples)) : 0,
+      lastMs: Number.isFinite(lastMs) ? clamp(lastMs, BOOT_EXPECTED_MIN_MS, BOOT_EXPECTED_MAX_MS) : BOOT_EXPECTED_FALLBACK_MS
+    };
+  } catch {
+    return { emaMs: BOOT_EXPECTED_FALLBACK_MS, samples: 0, lastMs: BOOT_EXPECTED_FALLBACK_MS };
+  }
+}
+
+function writeBootMetrics(actualMs) {
+  if (!Number.isFinite(actualMs) || actualMs <= 0) return;
+  const nextMs = clamp(Number(actualMs), BOOT_EXPECTED_MIN_MS, BOOT_EXPECTED_MAX_MS);
+  const prev = readBootMetrics();
+  const hasPrev = Number.isFinite(prev.emaMs) && prev.samples > 0;
+  const emaMs = hasPrev
+    ? (BOOT_EMA_ALPHA * nextMs + (1 - BOOT_EMA_ALPHA) * prev.emaMs)
+    : nextMs;
+  const payload = {
+    emaMs: clamp(emaMs, BOOT_EXPECTED_MIN_MS, BOOT_EXPECTED_MAX_MS),
+    samples: Math.min(50, (Number(prev.samples) || 0) + 1),
+    lastMs: nextMs,
+    at: new Date().toISOString()
+  };
+  try {
+    localStorage.setItem(BOOT_METRICS_KEY, JSON.stringify(payload));
+  } catch {
+    // ignore storage errors
+  }
+}
+
+function couponStorageKey() {
+  const base = String(store.auth.baseUrl || "").trim();
+  const apiKey = String(store.auth.apiKey || "").trim();
+  const devToken = String(store.auth.devToken || "").trim();
+  const mode = String(store.auth.authMode || "apiKey");
+  const account = String(store.auth.account || "").trim();
+  return `rainyun-coupons-cache:${base}|${mode}|${account}|${apiKey}|${devToken}`;
+}
+
+function loadCouponCacheFromLocal() {
+  try {
+    const raw = localStorage.getItem(couponStorageKey());
+    if (!raw) return;
+    const parsed = JSON.parse(raw);
+    const at = Number(parsed?.at || 0);
+    const rows = Array.isArray(parsed?.items) ? parsed.items : [];
+    if (!at || !rows.length) return;
+    if (Date.now() - at > COUPON_TTL_MS) return;
+    store.userCoupons = rows;
+    store.userCouponsAt = at;
+  } catch {
+    // ignore invalid cache
+  }
+}
+
+function saveCouponCacheToLocal(items) {
+  try {
+    const rows = Array.isArray(items) ? items : [];
+    const at = Date.now();
+    localStorage.setItem(couponStorageKey(), JSON.stringify({ at, items: rows }));
+    store.userCouponsAt = at;
+  } catch {
+    // ignore storage errors
+  }
+}
+
+function hasFreshCoupons() {
+  if (!Array.isArray(store.userCoupons) || !store.userCoupons.length) return false;
+  if (!store.userCouponsAt) return false;
+  return Date.now() - store.userCouponsAt < COUPON_TTL_MS;
+}
+
+function readJsonCache(key, fallback) {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return fallback;
+    const parsed = JSON.parse(raw);
+    return parsed === null || parsed === undefined ? fallback : parsed;
+  } catch {
+    return fallback;
+  }
+}
+
+function writeJsonCache(key, value) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    // ignore quota/storage errors
+  }
+}
+
+function toDayKey(dateLike = Date.now()) {
+  const d = new Date(dateLike);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+function extractPromoIncomeMetrics(userData) {
+  const p = userData && userData.Data && typeof userData.Data === "object" ? userData.Data : userData;
+  if (!p || typeof p !== "object") {
+    return {
+      incomeMode: "none",
+      monthIncome: null,
+      todayIncome: null,
+      totalIncome: null,
+      prevMonthIncome: null,
+      monthPoints: null,
+      totalPoints: null
+    };
+  }
+
+  const monthIncomeMoney = toNumberOrNull(
+    pickFirstFieldDeep(p, ["ResellMonthly", "resell_monthly", "month_income", "month_profit", "promotion_month_income"])
+  );
+  const todayIncomeMoney = toNumberOrNull(
+    pickFirstFieldDeep(p, ["ResellDaily", "resell_daily", "today_income", "promotion_today_income"])
+  );
+  const totalIncomeMoney = toNumberOrNull(
+    pickFirstFieldDeep(p, ["ResellAll", "resell_all", "total_income", "total_profit", "promotion_total_income"])
+  );
+  const prevMonthIncomeMoney = toNumberOrNull(
+    pickFirstFieldDeep(p, ["ResellBeforeMonth", "resell_before_month"])
+  );
+
+  const monthPoints = toNumberOrNull(pickFirstFieldDeep(p, ["ResellPointsMonthly", "resell_points_monthly"]));
+  const todayPoints = toNumberOrNull(pickFirstFieldDeep(p, ["ResellPointsDaily", "resell_points_daily"]));
+  const totalPoints = toNumberOrNull(pickFirstFieldDeep(p, ["ResellPointsAll", "resell_points_all"]));
+  const prevMonthPoints = toNumberOrNull(pickFirstFieldDeep(p, ["ResellPointsBeforeMonth", "resell_points_before_month"]));
+  const hasPointsIncomeField = [monthPoints, todayPoints, totalPoints, prevMonthPoints].some((v) => v !== null);
+  const hasMoneyIncomeField = [monthIncomeMoney, todayIncomeMoney, totalIncomeMoney, prevMonthIncomeMoney].some((v) => v !== null);
+
+  if (hasPointsIncomeField) {
+    // 对齐雨云推广中心：收益相关指标优先使用积分口径并换算元。
+    // 若某个积分字段缺失，则回退对应金额字段，避免阶段趋势出现缺失值。
+    return {
+      incomeMode: "points",
+      monthIncome: monthPoints === null ? monthIncomeMoney : (monthPoints / 2000),
+      todayIncome: todayPoints === null ? todayIncomeMoney : (todayPoints / 2000),
+      totalIncome: totalPoints === null ? totalIncomeMoney : (totalPoints / 2000),
+      prevMonthIncome: prevMonthPoints === null ? prevMonthIncomeMoney : (prevMonthPoints / 2000),
+      monthPoints,
+      totalPoints
+    };
+  }
+
+  if (hasMoneyIncomeField) {
+    return {
+      incomeMode: "money",
+      monthIncome: monthIncomeMoney,
+      todayIncome: todayIncomeMoney,
+      totalIncome: totalIncomeMoney,
+      prevMonthIncome: prevMonthIncomeMoney,
+      monthPoints,
+      totalPoints
+    };
+  }
+
+  return {
+    incomeMode: "none",
+    monthIncome: null,
+    todayIncome: null,
+    totalIncome: null,
+    prevMonthIncome: null,
+    monthPoints,
+    totalPoints
+  };
+}
+
+function parsePromoTotalIncomeFromUserData(userData) {
+  const metrics = extractPromoIncomeMetrics(userData);
+  return metrics.totalIncome;
+}
+
+function appendApiRequestCache(entry) {
+  const list = readJsonCache(API_REQUEST_CACHE_KEY, []);
+  const next = Array.isArray(list) ? list : [];
+  next.push(entry);
+  if (next.length > API_REQUEST_CACHE_LIMIT) {
+    next.splice(0, next.length - API_REQUEST_CACHE_LIMIT);
+  }
+  writeJsonCache(API_REQUEST_CACHE_KEY, next);
+}
+
+function appendPromoDailySnapshotFromUserPayload(payload) {
+  const data = extractPayloadData(payload);
+  const metrics = extractPromoIncomeMetrics(data);
+  const totalIncome = metrics.totalIncome;
+  if (totalIncome === null || !Number.isFinite(totalIncome)) return;
+  const incomeMode = metrics.incomeMode;
+  const day = toDayKey();
+  const nowIso = new Date().toISOString();
+  const cache = readJsonCache(PROMO_DAILY_CACHE_KEY, { updatedAt: "", series: [], incomeMode: "" });
+  const prevMode = String(cache?.incomeMode || "");
+  const series = (prevMode && prevMode !== incomeMode)
+    ? []
+    : (Array.isArray(cache?.series) ? cache.series : []);
+  const idx = series.findIndex((x) => x && x.day === day);
+  if (idx >= 0) {
+    const prev = Number(series[idx].totalIncome || 0);
+    series[idx] = {
+      day,
+      totalIncome: Math.max(prev, Number(totalIncome)),
+      lastSeenAt: nowIso
+    };
+  } else {
+    series.push({
+      day,
+      totalIncome: Number(totalIncome),
+      lastSeenAt: nowIso
+    });
+  }
+  series.sort((a, b) => String(a.day).localeCompare(String(b.day)));
+  if (series.length > PROMO_DAILY_CACHE_LIMIT) {
+    series.splice(0, series.length - PROMO_DAILY_CACHE_LIMIT);
+  }
+  writeJsonCache(PROMO_DAILY_CACHE_KEY, { updatedAt: nowIso, incomeMode, series });
+}
+
+function readPromoDailySeries() {
+  const cache = readJsonCache(PROMO_DAILY_CACHE_KEY, { updatedAt: "", series: [] });
+  const series = Array.isArray(cache?.series) ? cache.series : [];
+  return series
+    .map((x) => ({
+      day: String(x?.day || ""),
+      totalIncome: Number(x?.totalIncome || 0),
+      lastSeenAt: String(x?.lastSeenAt || "")
+    }))
+    .filter((x) => /^\d{4}-\d{2}-\d{2}$/.test(x.day) && Number.isFinite(x.totalIncome))
+    .sort((a, b) => a.day.localeCompare(b.day));
+}
+
+async function fetchCoupons(options = {}) {
+  const force = Boolean(options.force);
+  const preferCache = options.preferCache !== false;
+  if (!isAuthenticated()) return [];
+
+  if (preferCache && hasFreshCoupons() && !force) return store.userCoupons;
+  if (!store.userCoupons.length) loadCouponCacheFromLocal();
+  if (preferCache && hasFreshCoupons() && !force) return store.userCoupons;
+
+  if (!force && couponInflightPromise) return couponInflightPromise;
+  couponInflightPromise = (async () => {
+    const payload = await apiGet("/user/coupons/", { force, ttlMs: 30000 });
+    const data = extractPayloadData(payload);
+    const items = Array.isArray(data) ? data : [];
+    store.userCoupons = items;
+    saveCouponCacheToLocal(items);
+    return items;
+  })();
+
+  try {
+    return await couponInflightPromise;
+  } finally {
+    couponInflightPromise = null;
+  }
 }
 
 function authHeaders() {
@@ -138,6 +448,10 @@ function authHeaders() {
   if (store.auth.apiKey) h["x-api-key"] = store.auth.apiKey;
   if (store.auth.devToken) h["rain-dev-token"] = store.auth.devToken;
   return h;
+}
+
+function isAuthenticated() {
+  return Boolean(String(store.auth.apiKey || "").trim() || String(store.auth.devToken || "").trim());
 }
 
 function normalizeSummary(payload) {
@@ -301,7 +615,7 @@ function toAbsoluteUrl(url, base) {
 }
 
 function apiGetCacheKey(path) {
-  return `${String(store.auth.baseUrl || "").trim()}|${String(store.auth.apiKey || "").trim()}|${path}`;
+  return `${String(store.auth.baseUrl || "").trim()}|${String(store.auth.authMode || "apiKey").trim()}|${String(store.auth.account || "").trim()}|${String(store.auth.apiKey || "").trim()}|${String(store.auth.devToken || "").trim()}|${path}`;
 }
 
 async function apiGet(path, options = {}) {
@@ -363,6 +677,26 @@ async function apiRequest(method, path, body) {
       } catch {
         payload = { raw: text };
       }
+      appendApiRequestCache({
+        at: new Date().toISOString(),
+        method,
+        path,
+        url,
+        status: Number(res.status),
+        ok: Boolean(res.ok),
+        code: payload && typeof payload === "object" ? payload.code : undefined,
+        // 控制体积，避免本地缓存无限膨胀
+        payload:
+          payload && typeof payload === "object"
+            ? JSON.parse(JSON.stringify(payload, (k, v) => {
+              if (typeof v === "string" && v.length > 200) return `${v.slice(0, 200)}...(truncated)`;
+              return v;
+            }))
+            : payload
+      });
+      if (method === "GET" && path === "/user/" && res.ok) {
+        appendPromoDailySnapshotFromUserPayload(payload);
+      }
       reportLog("INFO", "api_request_done", { method, url, status: res.status, code: payload.code });
       if (!res.ok) throw new Error(`请求失败 ${res.status}`);
       return payload;
@@ -373,6 +707,184 @@ async function apiRequest(method, path, body) {
   }
 
   throw new Error(`网络请求失败，请检查 Base URL/网络：${String(lastError || "unknown")}`);
+}
+
+function normalizeBaseUrl(url) {
+  return String(url || "").trim().replace(/\/$/, "") || "https://api.v2.rainyun.com";
+}
+
+function pickCredentialCandidate(payload, keys) {
+  const v = pickFirstFieldDeep(payload, keys);
+  if (v === null || v === undefined || v === "") return "";
+  return String(v).trim();
+}
+
+function extractAuthCredential(payload) {
+  const root = payload && typeof payload === "object" ? payload : {};
+  const apiKey = pickCredentialCandidate(root, [
+    "APIKey", "api_key", "apikey", "apiKey", "x_api_key", "x-api-key", "XApiKey", "ApiKey", "key"
+  ]);
+  const token = pickCredentialCandidate(root, [
+    "APIToken", "api_token", "access_token", "token", "rain_dev_token", "rainDevToken", "dev_token", "devToken"
+  ]);
+  return {
+    apiKey: apiKey || "",
+    devToken: token || ""
+  };
+}
+
+function extractAuthCredentialFromHeaders(headers) {
+  if (!headers || typeof headers.get !== "function") return { apiKey: "", devToken: "" };
+  const directApiKey = String(headers.get("x-api-key") || headers.get("X-API-KEY") || "").trim();
+  const directDevToken = String(headers.get("rain-dev-token") || headers.get("Rain-Dev-Token") || "").trim();
+  const auth = String(headers.get("authorization") || headers.get("Authorization") || "").trim();
+  const bearer = auth.toLowerCase().startsWith("bearer ") ? auth.slice(7).trim() : "";
+  return {
+    apiKey: directApiKey || "",
+    devToken: directDevToken || bearer || ""
+  };
+}
+
+function authBodyCandidates(account, password, extras = {}) {
+  const accountText = String(account || "").trim();
+  const pwd = String(password || "");
+  const ticket = String(extras.captchaTicket || "").trim();
+  const randstr = String(extras.captchaRandstr || "").trim();
+  if (ticket) {
+    // 对齐主站：验证码场景只提交一次标准登录参数，避免票据被多次重放消耗。
+    return [{
+      field: accountText,
+      password: pwd,
+      vticket: ticket,
+      vrandstr: randstr
+    }];
+  }
+  return [
+    { field: accountText, password: pwd },
+    { account: accountText, password: pwd },
+    { username: accountText, password: pwd },
+    { email: accountText, password: pwd },
+    { name: accountText, password: pwd }
+  ];
+}
+
+async function tryAuthAction({ baseUrl, account, password, captchaTicket = "", captchaRandstr = "" }) {
+  const hasCaptcha = Boolean(String(captchaTicket || "").trim());
+  const paths = hasCaptcha ? ["/user/login"] : AUTH_LOGIN_PATHS;
+  const requestBodies = authBodyCandidates(account, password, { captchaTicket, captchaRandstr });
+  const base = normalizeBaseUrl(baseUrl);
+  let lastError = null;
+  const errors = [];
+
+  for (const path of paths) {
+    for (const body of requestBodies) {
+      const url = `${base}${path}`;
+      try {
+        const res = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+          cache: "no-store"
+        });
+        const text = await res.text();
+        let payload = {};
+        try {
+          payload = text ? JSON.parse(text) : {};
+        } catch {
+          payload = { raw: text };
+        }
+
+        if (!res.ok) {
+          const msg = String(pickFirstFieldDeep(payload, ["msg", "message", "error", "detail"]) || `HTTP ${res.status}`);
+          throw new Error(`${path} => ${msg}`);
+        }
+
+        const cred = extractAuthCredential(payload);
+        const headerCred = extractAuthCredentialFromHeaders(res.headers);
+        const mergedCred = {
+          apiKey: cred.apiKey || headerCred.apiKey || "",
+          devToken: cred.devToken || headerCred.devToken || ""
+        };
+        if (mergedCred.apiKey || mergedCred.devToken) {
+          return { ...mergedCred, path, payload };
+        }
+        if (hasCaptcha && path === "/user/login") {
+          // 主站现有行为：登录可能仅建立 Cookie 会话，不直接返回 APIKey/Token。
+          return { apiKey: "", devToken: "", path, payload, sessionOnly: true };
+        }
+        throw new Error(`${path} => 登录响应缺少认证字段（APIKey/Token）`);
+      } catch (e) {
+        lastError = e;
+        errors.push(String(e || ""));
+      }
+    }
+  }
+
+  const firstUseful = errors.find((x) => !x.includes("=> 找不到请求的对象/资源") && !x.includes("=> HTTP 404"));
+  throw new Error(`未能通过登录接口获取认证信息：${firstUseful || String(lastError || "unknown")}`);
+}
+
+let tencentCaptchaSdkPromise = null;
+function ensureTencentCaptchaSdk() {
+  if (typeof window === "undefined") return Promise.reject(new Error("当前环境不支持验证码"));
+  if (window.TencentCaptcha) return Promise.resolve();
+  if (tencentCaptchaSdkPromise) return tencentCaptchaSdkPromise;
+  tencentCaptchaSdkPromise = new Promise((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = "https://turing.captcha.qcloud.com/TCaptcha.js";
+    script.async = true;
+    script.onload = () => resolve();
+    script.onerror = () => reject(new Error("验证码 SDK 加载失败"));
+    document.head.appendChild(script);
+  }).catch((e) => {
+    tencentCaptchaSdkPromise = null;
+    throw e;
+  });
+  return tencentCaptchaSdkPromise;
+}
+
+async function runTencentCaptcha() {
+  await ensureTencentCaptchaSdk();
+  return new Promise((resolve, reject) => {
+    try {
+      const inst = new window.TencentCaptcha(TENCENT_CAPTCHA_APP_ID, (res = {}) => {
+        if (res.ret !== 0) {
+          if (res.ret === 2) {
+            reject(new Error("已取消验证码"));
+          } else {
+            reject(new Error("验证码未完成"));
+          }
+          return;
+        }
+        if (res.errorCode) {
+          reject(new Error(`验证码校验失败(${res.errorCode})`));
+          return;
+        }
+        resolve({
+          ticket: String(res.ticket || ""),
+          randstr: String(res.randstr || "")
+        });
+      });
+      inst.show();
+    } catch (e) {
+      reject(new Error(`验证码模块异常：${String(e || "unknown")}`));
+    }
+  });
+}
+
+async function validateAuth(baseUrl, apiKey, devToken) {
+  const base = normalizeBaseUrl(baseUrl);
+  const headers = { "Content-Type": "application/json" };
+  if (apiKey) headers["x-api-key"] = String(apiKey).trim();
+  if (devToken) headers["rain-dev-token"] = String(devToken).trim();
+  const res = await fetch(`${base}/user/`, {
+    method: "GET",
+    headers,
+    cache: "no-store"
+  });
+  if (!res.ok) {
+    throw new Error(`认证校验失败（/user/ ${res.status}）`);
+  }
 }
 
 function parseExpireForRenew(v) {
@@ -531,12 +1043,63 @@ async function splitRcsAndRgpuIds(rcsIds, force = false) {
   return { rcs, rgpu };
 }
 
-async function refreshSummary(force = false) {
-  if (!store.auth.apiKey) return;
-  if (!force && store.rawSummary && store.userProfile) {
-    const rows = await collectRenewRowsFromSummary(store.summary || {}, { maxDays: 7, includeRenewPrice: false });
+function hasFreshRenewRows() {
+  if (!Array.isArray(store.renewDueRows)) return false;
+  if (!store.renewDueAt) return false;
+  return Date.now() - store.renewDueAt < RENEW_ROWS_TTL_MS;
+}
+
+function hasFreshRenewPriceRows() {
+  if (!hasFreshRenewRows()) return false;
+  if (!store.renewDuePriceAt) return false;
+  if (Date.now() - store.renewDuePriceAt >= RENEW_PRICE_TTL_MS) return false;
+  return store.renewDueRows.every((row) => String(row.renewPrice || "").trim() !== "");
+}
+
+async function enrichRenewRowsWithPrice(force = false) {
+  if (!Array.isArray(store.renewDueRows) || !store.renewDueRows.length) return [];
+  if (!force && hasFreshRenewPriceRows()) return store.renewDueRows;
+  if (!force && renewPriceInflightPromise) return renewPriceInflightPromise;
+
+  renewPriceInflightPromise = (async () => {
+    const rows = store.renewDueRows.map((x) => ({ ...x }));
+    const queue = rows
+      .map((row, index) => ({ row, index }))
+      .filter(({ row }) => force || String(row.renewPrice || "").trim() === "");
+    let cursor = 0;
+    const concurrency = Math.min(4, queue.length || 1);
+
+    async function worker() {
+      while (cursor < queue.length) {
+        const idx = cursor;
+        cursor += 1;
+        const { row, index } = queue[idx];
+        try {
+          const renewPrice = await tryGetRenewPrice(row.kind, row.id);
+          if (renewPrice) rows[index].renewPrice = renewPrice;
+        } catch {
+          // 忽略单项续费价格失败，避免整页阻断
+        }
+      }
+    }
+
+    await Promise.all(Array.from({ length: concurrency }, () => worker()));
     store.renewDueRows = rows;
     store.renewDueCount = rows.length;
+    store.renewDuePriceAt = Date.now();
+    return rows;
+  })();
+
+  try {
+    return await renewPriceInflightPromise;
+  } finally {
+    renewPriceInflightPromise = null;
+  }
+}
+
+async function refreshSummary(force = false) {
+  if (!isAuthenticated()) return;
+  if (!force && store.rawSummary && store.userProfile && hasFreshRenewRows()) {
     return;
   }
   if (summaryInflightPromise) return summaryInflightPromise;
@@ -547,9 +1110,13 @@ async function refreshSummary(force = false) {
   summaryInflightPromise = (async () => {
     store.loading = true;
     try {
-      const [userRes, couponRes, newsRes, productRes] = await Promise.allSettled([
+      if (!store.userCoupons.length) loadCouponCacheFromLocal();
+      fetchCoupons({ force, preferCache: true }).catch((e) => {
+        reportLog("WARN", "user_coupons_load_error", { error: String(e) });
+      });
+
+      const [userRes, newsRes, productRes] = await Promise.allSettled([
         apiGet("/user/", { force, ttlMs: 15000 }),
-        apiGet("/user/coupons/", { force, ttlMs: 10000 }),
         apiGet("/news", { force, ttlMs: 10000 }),
         apiGet("/product/", { force, ttlMs: 10000 })
       ]);
@@ -559,14 +1126,6 @@ async function refreshSummary(force = false) {
         store.userProfile = userPayload && userPayload.data ? userPayload.data : userPayload;
       } else {
         reportLog("WARN", "user_profile_load_error", { error: String(userRes.reason) });
-      }
-
-      if (couponRes.status === "fulfilled") {
-        const couponData = extractPayloadData(couponRes.value);
-        store.userCoupons = Array.isArray(couponData) ? couponData : [];
-      } else {
-        store.userCoupons = [];
-        reportLog("WARN", "user_coupons_load_error", { error: String(couponRes.reason) });
       }
 
       if (newsRes.status === "fulfilled") {
@@ -616,10 +1175,14 @@ async function refreshSummary(force = false) {
         const rows = await collectRenewRowsFromSummary(s, { maxDays: 7, includeRenewPrice: false });
         store.renewDueRows = rows;
         store.renewDueCount = rows.length;
+        store.renewDueAt = Date.now();
+        store.renewDuePriceAt = 0;
       } catch (e) {
         reportLog("WARN", "renew_due_count_error", { error: String(e) });
         store.renewDueRows = [];
         store.renewDueCount = 0;
+        store.renewDueAt = 0;
+        store.renewDuePriceAt = 0;
       }
       if (summaryIsEmpty(s)) {
         toast("当前账号暂无产品数据");
@@ -629,6 +1192,8 @@ async function refreshSummary(force = false) {
       reportLog("ERROR", "summary_load_error", { error: String(e) });
       store.renewDueRows = [];
       store.renewDueCount = 0;
+      store.renewDueAt = 0;
+      store.renewDuePriceAt = 0;
     } finally {
       store.loading = false;
       summaryInflightPromise = null;
@@ -658,10 +1223,53 @@ function extractPayloadData(payload) {
   return {};
 }
 
+function normalizeUpdateNotes(raw) {
+  if (Array.isArray(raw)) {
+    return raw
+      .map((item) => {
+        if (item === null || item === undefined) return "";
+        if (typeof item === "string") return item;
+        if (typeof item === "object") {
+          return String(
+            pickFirstFieldDeep(item, ["note", "notes", "text", "title", "content", "message", "body"]) || ""
+          );
+        }
+        return String(item);
+      })
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  if (raw && typeof raw === "object") {
+    const nested =
+      pickFirstFieldDeep(raw, ["notes", "body", "text", "content", "message", "desc", "description"]) ||
+      pickFirstFieldDeep(raw, ["changes", "items", "logs", "list"]);
+    return normalizeUpdateNotes(nested);
+  }
+
+  const text = String(raw || "").replace(/\r\n?/g, "\n").replace(/\\n/g, "\n").trim();
+  if (!text) return "";
+  return text
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .join("\n");
+}
+
+function formatUpdateNotesForDialog(notesText) {
+  const lines = String(notesText || "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (!lines.length) return "暂无更新说明";
+  return lines.map((line) => `- ${line}`).join("\n");
+}
+
 function extractUpdateInfo(payload) {
   const p = payload && typeof payload === "object" ? payload : {};
   const version = pickUpdateField(p, ["version", "latestVersion", "tag_name"]);
-  const notes = pickUpdateField(p, ["notes", "body"]);
+  const notes = normalizeUpdateNotes(pickUpdateField(p, ["notes", "body", "changes", "changelog", "logs"]));
   let downloadUrl = pickUpdateField(p, ["downloadUrl", "url", "html_url", "browser_download_url"]);
   if (!downloadUrl) {
     const assets = p.assets;
@@ -1116,10 +1724,14 @@ const MobileShell = {
     <div class="mobile-app" @touchstart.passive="onTouchStart" @touchmove.passive="onTouchMove" @touchend="onTouchEnd">
       <header class="m-header">
         <img :src="logo" alt="logo" />
-        <div>
+        <div class="m-header-main">
           <h1>雨云 App</h1>
           <p>{{ title }}</p>
         </div>
+        <button class="m-header-account" @click="goAccount">
+          <img :src="avatar" alt="account" class="m-header-account-avatar" />
+          <span>{{ isAuthed ? '已登录' : '去登录' }}</span>
+        </button>
       </header>
 
       <main :class="mainClass"><slot /></main>
@@ -1127,7 +1739,7 @@ const MobileShell = {
       <nav class="m-tabbar">
         <button :class="tabClass('/home')" @click="go('/home')"><i class="fa-solid fa-house"></i><span>主页</span></button>
         <button :class="tabClass('/promo')" @click="go('/promo')"><i class="fa-solid fa-bullhorn"></i><span>推广中心</span></button>
-        <button :class="tabClass('/me')" @click="go('/me')"><i class="fa-solid fa-user"></i><span>我的</span></button>
+        <button :class="tabClass(isAuthed ? '/me' : '/login')" @click="go(isAuthed ? '/me' : '/login')"><i class="fa-solid fa-user"></i><span>我的</span></button>
       </nav>
     </div>
   `,
@@ -1135,14 +1747,16 @@ const MobileShell = {
   setup() {
     const router = useRouter();
     const route = useRoute();
+    const isAuthed = computed(() => isAuthenticated());
     const touchState = { active: false, startX: 0, startY: 0, deltaX: 0, deltaY: 0 };
     const isTabRootPath = (path) => {
       const p = String(path || "/");
-      return p === "/" || p === "/home" || p === "/promo" || p === "/me";
+      return p === "/" || p === "/home" || p === "/promo" || p === "/me" || p === "/login";
     };
     const tabClass = (path) => ["tab-item", route.path.startsWith(path) ? "active" : ""];
     // Tab 页面切换不进入 history，避免返回键在三个 Tab 之间来回切换。
     const go = (path) => router.replace(path);
+    const goAccount = () => go(isAuthed.value ? "/me" : "/login");
     const fallbackRouteByPath = (path) => {
       const p = String(path || "/");
       if (p === "/" || p === "/home") return "/home";
@@ -1196,7 +1810,14 @@ const MobileShell = {
       if (route.path === "/home") classes.push("m-main-home");
       return classes;
     });
-    return { go, tabClass, mainClass, logo: BRAND_LOGO, onTouchStart, onTouchMove, onTouchEnd };
+    const avatar = computed(() => {
+      const profile = store.userProfile || {};
+      return normalizeAssetUrl(
+        pickFirstFieldDeep(profile, ["IconUrl", "iconUrl", "icon_url", "avatar", "avatar_url", "headimgurl", "head_img", "face"]) ||
+        AVATAR
+      );
+    });
+    return { go, goAccount, tabClass, mainClass, logo: BRAND_LOGO, onTouchStart, onTouchMove, onTouchEnd, isAuthed, avatar };
   }
 };
 
@@ -1466,24 +2087,21 @@ const TodoPage = {
 
     async function loadRenews() {
       await refreshSummary(false);
-      const rows = await collectRenewRowsFromSummary(store.summary, { maxDays: 7, includeRenewPrice: true });
-      store.renewDueRows = rows.map((x) => ({ ...x, renewPrice: "" }));
-      store.renewDueCount = store.renewDueRows.length;
-      renewRows.value = rows;
+      const baseRows = Array.isArray(store.renewDueRows) ? store.renewDueRows.map((x) => ({ ...x })) : [];
+      renewRows.value = baseRows;
+      if (!baseRows.length) return;
+      const pricedRows = await enrichRenewRowsWithPrice(false);
+      renewRows.value = Array.isArray(pricedRows) ? pricedRows.map((x) => ({ ...x })) : [];
     }
 
     async function loadCoupons() {
-      const payload = await apiGet("/user/coupons/");
-      const data = extractPayloadData(payload);
-      const items = Array.isArray(data) ? data : [];
-      store.userCoupons = items;
-      couponRows.value = items.map((item) => {
+      const productMap = { rcs: "云服务器", rca: "云应用", rgs: "游戏云", ros: "对象存储", rbm: "裸金属", rvh: "虚拟主机" };
+      const sceneMap = { renew: "续费", create: "新购", upgrade: "升级" };
+      const mapCouponRows = (items) => (Array.isArray(items) ? items : []).map((item) => {
         const rawType = String(item.type || "normal").toLowerCase();
         const used = Number(item.use_date || 0) > 0;
         const expired = Number(item.exp_date || 0) > 0 && (Number(item.exp_date) * 1000 < Date.now());
         const statusText = used ? "已使用" : (expired ? "已过期" : "可使用");
-        const productMap = { rcs: "云服务器", rca: "云应用", rgs: "游戏云", ros: "对象存储", rbm: "裸金属", rvh: "虚拟主机" };
-        const sceneMap = { renew: "续费", create: "新购", upgrade: "升级" };
         const productText = String(item.usable_product || "")
           .split(",")
           .filter(Boolean)
@@ -1508,6 +2126,13 @@ const TodoPage = {
           statusText
         };
       });
+
+      if (Array.isArray(store.userCoupons) && store.userCoupons.length) {
+        couponRows.value = mapCouponRows(store.userCoupons);
+      }
+
+      const items = await fetchCoupons({ force: false, preferCache: true });
+      couponRows.value = mapCouponRows(items);
     }
 
     async function loadData() {
@@ -2033,7 +2658,6 @@ const PromoPage = {
           <a-typography-text class="panel-subtext" type="secondary">等级：{{ promo.level }}</a-typography-text>
           <div class="promo-tags">
             <span class="promo-chip">{{ promo.badge }}</span>
-            <span class="promo-chip ghost">邀请码 {{ promo.shareCode }}</span>
           </div>
         </div>
       </section>
@@ -2052,13 +2676,29 @@ const PromoPage = {
       </section>
 
       <section class="panel kpi-grid">
-        <div><b>{{ promo.monthIncome }}</b><span>本月收益(元)</span></div>
+        <div class="panel-title promo-kpi-title">
+          <a-typography-title :heading="6" class="typo-title">长期经营概览</a-typography-title>
+          <a-button class="line-btn sm" size="small" type="outline" @click="openDailyReport">每日收益分析</a-button>
+        </div>
         <div><b>{{ promo.totalIncome }}</b><span>总收益(元)</span></div>
+        <div><b>{{ promo.subUserAll }}</b><span>总客户数</span></div>
+        <div><b>{{ promo.totalStockAll }}</b><span>累计进货</span></div>
+        <div><b>{{ promo.totalPointsAll }}</b><span>累计积分</span></div>
+        <div><b>{{ promo.incomePerUser }}</b><span>单客累计贡献(元)</span></div>
+        <div><b>{{ promo.avgAllDaily }}</b><span>累计日均收益(元)</span></div>
+        <div><b>{{ promo.activeDays }}</b><span>经营天数</span></div>
+      </section>
+
+      <section class="panel kpi-grid">
+        <div class="panel-title promo-kpi-title">
+          <a-typography-title :heading="6" class="typo-title">阶段趋势</a-typography-title>
+          <a-typography-text class="panel-subtext" type="secondary">近周期指标</a-typography-text>
+        </div>
+        <div><b>{{ promo.monthIncome }}</b><span>本月收益(元)</span></div>
         <div><b>{{ promo.prevMonthIncome }}</b><span>上月收益(元)</span></div>
         <div><b>{{ promo.momRate }}</b><span>收益环比</span></div>
         <div><b>{{ promo.todayStock }}</b><span>今日进货</span></div>
         <div><b>{{ promo.monthStock }}</b><span>本月进货</span></div>
-        <div><b>{{ promo.subUserAll }}</b><span>总客户数</span></div>
         <div><b>{{ promo.monthNewUser }}</b><span>本月新增客户</span></div>
       </section>
 
@@ -2088,24 +2728,101 @@ const PromoPage = {
         <div class="kv"><span>可发优惠券</span><b>{{ promo.canSendCoupons }}</b></div>
         <div class="kv"><span>可自定义推广码</span><b>{{ promo.canCustomCode }}</b></div>
       </section>
+
+      <div v-if="showDailyReport" class="promo-report-mask" @click.self="closeDailyReport">
+        <div class="promo-report-modal">
+          <div class="promo-report-head">
+            <h3>每日收益分析</h3>
+            <button class="about-close" @click="closeDailyReport"><i class="fa-solid fa-xmark"></i></button>
+          </div>
+          <div class="promo-report-meta">
+            <span>数据来源：<code>/user/</code></span>
+            <span>分析时间：{{ dailyReport.generatedAt }}</span>
+          </div>
+          <div class="promo-report-kv">
+            <div><b>{{ dailyReport.todayIncome }}</b><span>今日收益</span></div>
+            <div><b>{{ dailyReport.yesterdayIncome }}</b><span>昨日收益</span></div>
+            <div><b>{{ dailyReport.avgDaily }}</b><span>本月日均</span></div>
+            <div><b>{{ dailyReport.avg7d }}</b><span>近7日日均</span></div>
+            <div><b>{{ dailyReport.sum7d }}</b><span>近7日累计</span></div>
+            <div><b>{{ dailyReport.forecastMonth }}</b><span>本月预测</span></div>
+            <div><b>{{ dailyReport.trend }}</b><span>趋势判断</span></div>
+            <div><b>{{ dailyReport.volatility }}</b><span>波动率</span></div>
+            <div><b>{{ dailyReport.progress }}</b><span>月度进度</span></div>
+          </div>
+          <div class="promo-report-note">
+            <div><b>数据可信度：</b>{{ dailyReport.confidence }}</div>
+            <div><b>缓存覆盖：</b>{{ dailyReport.coverage }}（实测 {{ dailyReport.measuredDays }} 天，推算 {{ dailyReport.estimatedDays }} 天）</div>
+          </div>
+          <div class="promo-report-note">{{ dailyReport.note }}</div>
+          <div class="promo-report-list">
+            <div class="promo-report-row" v-for="row in dailyReport.rows" :key="row.date">
+              <span>{{ row.date }}</span>
+              <b>{{ row.income }}</b>
+              <small>{{ row.tag }}</small>
+            </div>
+          </div>
+          <div class="about-actions">
+            <a-button class="line-btn" type="outline" @click="refreshDailyReport">重新分析</a-button>
+            <a-button class="primary-btn" type="primary" @click="closeDailyReport">完成</a-button>
+          </div>
+        </div>
+      </div>
     </MobileShell>
   `,
   setup() {
     const profile = computed(() => store.userProfile || {});
+    const showDailyReport = ref(false);
+    const dailyReport = ref({
+      todayIncome: "-",
+      yesterdayIncome: "-",
+      avgDaily: "-",
+      avg7d: "-",
+      sum7d: "-",
+      forecastMonth: "-",
+      trend: "-",
+      volatility: "-",
+      progress: "-",
+      confidence: "-",
+      coverage: "-",
+      measuredDays: 0,
+      estimatedDays: 0,
+      generatedAt: "-",
+      note: "",
+      rows: []
+    });
     const promo = computed(() => {
       const p = profile.value;
       const vip = p.VIP && typeof p.VIP === "object" ? p.VIP : {};
-      const monthPoints = toNumberOrNull(pickFirstFieldDeep(p, ["ResellPointsMonthly", "resell_points_monthly"]));
-      const totalPoints = toNumberOrNull(pickFirstFieldDeep(p, ["ResellPointsAll", "resell_points_all"]));
+      const incomeMetrics = extractPromoIncomeMetrics(p);
+      const monthPoints = incomeMetrics.monthPoints;
+      const totalPoints = incomeMetrics.totalPoints;
       const shareCode = String(pickFirstFieldDeep(p, ["ShareCode", "share_code", "invite_code", "code"]) || "-");
       const primaryCurrent = toNumberOrNull(pickFirstFieldDeep(p, ["StockQuarter", "stock_quarter", "quarter_stock"])) ?? 0;
       const secondaryCurrent = toNumberOrNull(pickFirstFieldDeep(p, ["SecondStockQuarter", "second_stock_quarter"])) ?? 0;
       const primaryTarget = toNumberOrNull(vip.StockRequire) ?? 0;
       const secondaryTarget = toNumberOrNull(vip.SecondStockRequire) ?? 0;
-      const monthIncomeByPoints = monthPoints === null ? null : monthPoints / 2000;
-      const totalIncomeByPoints = totalPoints === null ? null : totalPoints / 2000;
-      const prevMonthIncome = toNumberOrNull(pickFirstFieldDeep(p, ["ResellBeforeMonth", "resell_before_month"]));
-      const currMonthIncomeRaw = monthIncomeByPoints ?? toNumberOrNull(pickFirstFieldDeep(p, ["ResellMonthly", "resell_monthly"]));
+      const prevMonthIncome = incomeMetrics.prevMonthIncome;
+      const currMonthIncomeRaw = incomeMetrics.monthIncome ?? 0;
+      const todayIncomeRaw = incomeMetrics.todayIncome ?? 0;
+      const totalIncomeRaw = incomeMetrics.totalIncome ?? 0;
+      const totalStockRaw = toNumberOrNull(pickFirstFieldDeep(p, ["StockAll", "stock_all", "promotion_total_stock"])) ?? 0;
+      const subUserAllRaw = toNumberOrNull(pickFirstFieldDeep(p, ["SubUserAll", "sub_user_all", "customer_total"])) ?? 0;
+      const monthNewUserRaw = toNumberOrNull(pickFirstFieldDeep(p, ["SubUserMonthly", "sub_user_monthly", "customer_monthly"])) ?? 0;
+      const totalPointsAllRaw = totalPoints ?? 0;
+      const incomePerUserRaw = subUserAllRaw > 0 ? totalIncomeRaw / subUserAllRaw : null;
+      const registerRaw = pickFirstFieldDeep(p, ["RegisterTime", "register_time", "RegisterDate", "register_date", "CreatedAt", "created_at", "CreateTime", "create_time", "RegTime", "reg_time"]);
+      let activeDays = null;
+      if (registerRaw !== null && registerRaw !== undefined && registerRaw !== "") {
+        const n = Number(registerRaw);
+        const d = Number.isFinite(n)
+          ? new Date(n > 1000000000000 ? n : (n > 1000000000 ? n * 1000 : n))
+          : new Date(String(registerRaw));
+        if (!Number.isNaN(d.getTime())) {
+          activeDays = Math.max(1, Math.floor((Date.now() - d.getTime()) / 86400000) + 1);
+        }
+      }
+      const avgAllDailyRaw = activeDays ? (totalIncomeRaw / activeDays) : null;
       const momRate = (currMonthIncomeRaw !== null && prevMonthIncome && prevMonthIncome !== 0)
         ? (((currMonthIncomeRaw - prevMonthIncome) / prevMonthIncome) * 100)
         : null;
@@ -2118,18 +2835,23 @@ const PromoPage = {
         badge: String(vip.AgentTitle || pickByAlias(p, ["AgentTitle", "agent_level_name", "agent_title", "agent_badge", "promotion_level_name"], "-")),
         shareCode,
         link: `https://www.rainyun.com/${encodeURIComponent(shareCode === "-" ? "" : shareCode)}_`,
-        monthIncome: formatMoney(
-          currMonthIncomeRaw ?? pickFirstFieldDeep(p, ["month_income", "month_profit", "promotion_month_income", "ResellMonthly"])
-        ).replace("¥ ", ""),
-        totalIncome: formatMoney(
-          totalIncomeByPoints ?? pickFirstFieldDeep(p, ["total_income", "total_profit", "promotion_total_income", "ResellAll"])
-        ).replace("¥ ", ""),
+        monthIncome: formatMoney(currMonthIncomeRaw).replace("¥ ", ""),
+        monthIncomeRaw: currMonthIncomeRaw,
+        totalIncome: formatMoney(totalIncomeRaw).replace("¥ ", ""),
+        totalIncomeRaw,
         prevMonthIncome: formatMoney(prevMonthIncome).replace("¥ ", ""),
+        prevMonthIncomeRaw: prevMonthIncome ?? 0,
+        todayIncomeRaw,
         momRate: momRate === null ? "-" : `${momRate >= 0 ? "+" : ""}${formatFixed2(momRate)}%`,
         todayStock: formatCount(pickFirstFieldDeep(p, ["StockDaily", "today_stock", "today_purchase", "promotion_today_stock"])),
         monthStock: formatFixed2(pickFirstFieldDeep(p, ["StockMonthly", "month_stock", "month_purchase", "promotion_month_stock"])),
-        subUserAll: formatCount(pickFirstFieldDeep(p, ["SubUserAll", "sub_user_all", "customer_total"])),
-        monthNewUser: formatCount(pickFirstFieldDeep(p, ["SubUserMonthly", "sub_user_monthly", "customer_monthly"])),
+        subUserAll: formatCount(subUserAllRaw),
+        monthNewUser: formatCount(monthNewUserRaw),
+        totalStockAll: formatFixed2(totalStockRaw),
+        totalPointsAll: formatCount(totalPointsAllRaw),
+        incomePerUser: incomePerUserRaw === null ? "-" : formatFixed2(incomePerUserRaw),
+        avgAllDaily: avgAllDailyRaw === null ? "-" : formatFixed2(avgAllDailyRaw),
+        activeDays: activeDays === null ? "-" : formatCount(activeDays),
         primaryProgress: Number(primaryProgress.toFixed(2)),
         primaryProgressText: `${formatFixed2(primaryCurrent)} / ${formatFixed2(primaryTarget)}`,
         secondaryProgress: Number(secondaryProgress.toFixed(2)),
@@ -2203,8 +2925,173 @@ const PromoPage = {
       }
       await copyLink();
     }
+    function buildDailyIncomeReport() {
+      const now = new Date();
+      const monthIncome = Math.max(0, Number(promo.value.monthIncomeRaw || 0));
+      const prevMonthIncome = Math.max(0, Number(promo.value.prevMonthIncomeRaw || 0));
+      const todayIncome = Math.max(0, Number(promo.value.todayIncomeRaw || 0));
+      const dayIndex = Math.max(1, now.getDate());
+      const daysInMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
+      const avgDaily = monthIncome / dayIndex;
+      const forecastMonth = avgDaily * daysInMonth;
+      const comparedAvg = prevMonthIncome > 0 ? prevMonthIncome / daysInMonth : 0;
+      const trendValue = comparedAvg > 0 ? ((avgDaily - comparedAvg) / comparedAvg) * 100 : null;
+      const trend = trendValue === null ? "样本不足" : `${trendValue >= 0 ? "增长" : "回落"} ${formatFixed2(Math.abs(trendValue))}%`;
+
+      const beforeTodayDays = Math.max(1, dayIndex - 1);
+      const estBeforeToday = Math.max(0, (monthIncome - todayIncome) / beforeTodayDays);
+      const series = readPromoDailySeries();
+      const totalByDay = new Map(series.map((x) => [x.day, x.totalIncome]));
+      const rows = [];
+      for (let i = 6; i >= 0; i -= 1) {
+        const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() - i);
+        const isToday = i === 0;
+        const dayKey = toDayKey(d);
+        const prevDay = toDayKey(new Date(d.getFullYear(), d.getMonth(), d.getDate() - 1));
+        const dateText = `${d.getMonth() + 1}/${d.getDate()}`;
+        const currTotal = totalByDay.get(dayKey);
+        const prevTotal = totalByDay.get(prevDay);
+        let incomeValue = 0;
+        let tag = "推算";
+        if (isToday) {
+          incomeValue = todayIncome;
+          tag = "实时";
+        } else if (Number.isFinite(currTotal) && Number.isFinite(prevTotal)) {
+          incomeValue = Math.max(0, Number(currTotal) - Number(prevTotal));
+          tag = "缓存实测";
+        } else if (Number.isFinite(currTotal) && !Number.isFinite(prevTotal)) {
+          incomeValue = Math.max(0, Number(currTotal));
+          tag = "缓存首日";
+        } else {
+          incomeValue = estBeforeToday;
+          tag = "推算";
+        }
+        rows.push({
+          date: dateText,
+          value: Number(incomeValue),
+          income: `¥ ${formatFixed2(incomeValue)}`,
+          tag
+        });
+      }
+
+      const historyRows = rows.filter((x) => x.tag !== "实时");
+      const measuredRows = historyRows.filter((x) => x.tag === "缓存实测" || x.tag === "缓存首日");
+      const estimatedRows = historyRows.filter((x) => x.tag === "推算");
+      const yRow = rows[rows.length - 2] || null;
+      const sum7dValue = rows.reduce((sum, x) => sum + Number(x.value || 0), 0);
+      const avg7dValue = sum7dValue / Math.max(1, rows.length);
+      const historyVals = historyRows.map((x) => Number(x.value || 0));
+      const meanHist = historyVals.reduce((sum, x) => sum + x, 0) / Math.max(1, historyVals.length);
+      const variance = historyVals.reduce((sum, x) => sum + ((x - meanHist) ** 2), 0) / Math.max(1, historyVals.length);
+      const std = Math.sqrt(Math.max(0, variance));
+      const volatility = meanHist > 0 ? (std / meanHist) * 100 : 0;
+      const progress = daysInMonth > 0 ? (dayIndex / daysInMonth) * 100 : 0;
+      const coverageStart = series.length ? series[0].day : "";
+      const coverageEnd = series.length ? series[series.length - 1].day : "";
+      const coverage = coverageStart && coverageEnd ? `${coverageStart} ~ ${coverageEnd}` : "暂无";
+      const confidenceRate = historyRows.length > 0 ? (measuredRows.length / historyRows.length) : 0;
+      let confidence = "低";
+      if (confidenceRate >= 0.8) confidence = "高";
+      else if (confidenceRate >= 0.4) confidence = "中";
+
+      const hasRealRows = rows.some((x) => x.tag === "缓存实测" || x.tag === "缓存首日");
+      dailyReport.value = {
+        todayIncome: `¥ ${formatFixed2(todayIncome)}`,
+        yesterdayIncome: yRow ? `¥ ${formatFixed2(yRow.value || 0)}` : "-",
+        avgDaily: `¥ ${formatFixed2(avgDaily)}`,
+        avg7d: `¥ ${formatFixed2(avg7dValue)}`,
+        sum7d: `¥ ${formatFixed2(sum7dValue)}`,
+        forecastMonth: `¥ ${formatFixed2(forecastMonth)}`,
+        trend,
+        volatility: `${formatFixed2(volatility)}%`,
+        progress: `${formatFixed2(progress)}%`,
+        confidence,
+        coverage,
+        measuredDays: measuredRows.length,
+        estimatedDays: estimatedRows.length,
+        generatedAt: now.toLocaleString(),
+        note: hasRealRows
+          ? "说明：已启用本地请求缓存，历史日收益优先使用缓存实测差值；缺失日期回退推算。"
+          : "说明：当前暂无足够历史缓存，近7天收益暂按本月累计收益推算，后续会逐步变为实测。",
+        rows
+      };
+    }
+    function openDailyReport() {
+      buildDailyIncomeReport();
+      showDailyReport.value = true;
+    }
+    function refreshDailyReport() {
+      buildDailyIncomeReport();
+      toast("分析已更新");
+    }
+    function closeDailyReport() {
+      showDailyReport.value = false;
+    }
     onMounted(() => refreshSummary(false));
-    return { avatar, promo, copyLink, openLink, shareLink };
+    return { avatar, promo, copyLink, openLink, shareLink, showDailyReport, dailyReport, openDailyReport, refreshDailyReport, closeDailyReport };
+  }
+};
+
+const LoginPage = {
+  components: { MobileShell },
+  template: `
+    <MobileShell title="登录">
+      <section class="panel login-hero">
+        <a-typography-title :heading="5" class="typo-title">API Key 登录</a-typography-title>
+        <a-typography-text class="panel-subtext" type="secondary">仅需输入 API Key 即可完成登录。</a-typography-text>
+      </section>
+
+      <section class="panel login-panel">
+        <div class="form-grid">
+          <label>API Key
+            <a-input v-model="form.apiKey" placeholder="请输入 API Key" />
+          </label>
+        </div>
+        <div class="btn-row">
+          <a-button class="primary-btn" type="primary" :loading="loading" @click="submitLogin">保存并同步</a-button>
+        </div>
+      </section>
+    </MobileShell>
+  `,
+  setup() {
+    const router = useRouter();
+    const loading = ref(false);
+    const form = reactive({
+      apiKey: store.auth.apiKey || ""
+    });
+
+    async function submitLogin() {
+      const apiKey = String(form.apiKey || "").trim();
+      if (!apiKey) {
+        toast("请填写 API Key");
+        return;
+      }
+      const baseUrl = normalizeBaseUrl(store.auth.baseUrl || "https://api.v2.rainyun.com");
+      loading.value = true;
+      try {
+        await validateAuth(baseUrl, apiKey, "");
+        saveAuth({
+          baseUrl,
+          apiKey,
+          devToken: "",
+          authMode: "apiKey",
+          account: ""
+        });
+        await refreshSummary(true);
+        toast("登录成功");
+        router.replace("/home");
+      } catch (e) {
+        toast(`登录失败：${String(e || "")}`);
+      } finally {
+        loading.value = false;
+      }
+    }
+
+    onMounted(() => {
+      if (isAuthenticated()) router.replace("/home");
+    });
+
+    return { form, loading, submitLogin };
   }
 };
 
@@ -2236,17 +3123,12 @@ const MePage = {
       </section>
 
       <section class="panel">
-        <div class="panel-title"><a-typography-title :heading="6" class="typo-title">账号配置</a-typography-title></div>
-        <div class="form-grid">
-          <label>X-Api-Key
-            <div class="input-with-action">
-              <a-input :type="showApiKey ? 'text' : 'password'" v-model="form.apiKey" />
-              <a-button class="line-btn sm" size="small" type="outline" @click="toggleApiKey">{{ showApiKey ? '隐藏' : '显示' }}</a-button>
-            </div>
-          </label>
-        </div>
+        <div class="panel-title"><a-typography-title :heading="6" class="typo-title">账号中心</a-typography-title></div>
+        <div class="kv"><span>认证方式</span><b>{{ authInfo.modeText }}</b></div>
+        <div class="kv"><span>认证标识</span><b>{{ authInfo.masked }}</b></div>
         <div class="btn-row">
-          <a-button class="primary-btn" type="primary" @click="save">保存并刷新</a-button>
+          <a-button class="primary-btn" type="primary" @click="goLogin">编辑 API Key</a-button>
+          <a-button class="line-btn" type="outline" @click="logout">退出登录</a-button>
           <a-button class="line-btn about-btn" type="outline" @click="openAbout">关于应用</a-button>
           <a-button class="line-btn update-btn" type="outline" @click="checkUpdate">检查更新</a-button>
         </div>
@@ -2258,17 +3140,19 @@ const MePage = {
             <a-typography-title :heading="5" class="typo-title">关于应用</a-typography-title>
             <button class="about-close" @click="closeAbout"><i class="fa-solid fa-xmark"></i></button>
           </div>
-          <div class="about-brand">
+          <div class="about-hero">
             <img :src="brandLogo" alt="logo" />
-            <div>
+            <div class="about-hero-main">
               <b>RainYun APP</b>
               <p>新一代云服务提供商</p>
+              <div class="about-hero-meta">
+                <span>v{{ appVersion }}</span>
+                <span>API Key 模式</span>
+              </div>
             </div>
           </div>
-          <div class="kv"><span>版本</span><b>{{ appVersion }}</b></div>
-          <div class="kv"><span>更新源</span><b class="about-url">{{ updateBaseUrl }}</b></div>
-          <div class="kv kv-stack">
-            <span>技术栈</span>
+          <section class="about-section">
+            <h4>技术栈</h4>
             <div class="about-tech-tags">
               <a-tag size="small" color="arcoblue">Vue 3</a-tag>
               <a-tag size="small" color="cyan">Vue Router 4</a-tag>
@@ -2276,19 +3160,13 @@ const MePage = {
               <a-tag size="small" color="green">Vite 5</a-tag>
               <a-tag size="small" color="purple">Capacitor 7</a-tag>
             </div>
-          </div>
-          <div class="about-block">
-            <h4>致谢</h4>
-            <p>感谢 RainYun 官方 API 提供数据能力。</p>
-            <p>感谢社区项目 <code>rainyun-go-sdk</code> 提供接口参考与字段映射思路。</p>
-          </div>
-          <div class="about-block">
-            <h4>免责声明</h4>
+          </section>
+          <section class="about-section">
+            <h4>说明</h4>
             <p>本 App 基于 RainYun API 开发，与雨云官方客户端并非同一产品。</p>
             <p>API Key 仅用于你与 RainYun API 的请求交互，不会上传至开发者服务器。</p>
-          </div>
-          <div class="about-actions">
-            <a-button class="line-btn" type="outline" @click="copyUpdateUrl">复制更新源</a-button>
+          </section>
+          <div class="about-modal-actions">
             <a-button class="primary-btn" type="primary" @click="closeAbout">我知道了</a-button>
           </div>
         </div>
@@ -2298,8 +3176,7 @@ const MePage = {
   `,
   setup() {
     const summary = computed(() => store.summary);
-    const form = reactive({ ...store.auth });
-    const showApiKey = ref(false);
+    const router = useRouter();
     const showAboutModal = ref(false);
 
     const userCard = computed(() => {
@@ -2335,20 +3212,20 @@ const MePage = {
       );
     });
 
-    const toggleApiKey = () => {
-      showApiKey.value = !showApiKey.value;
+    const authInfo = computed(() => {
+      const raw = String(store.auth.apiKey || "");
+      const masked = raw ? `${raw.slice(0, 3)}***${raw.slice(-3)}` : "-";
+      return { modeText: "API Key", masked };
+    });
+    const goLogin = () => router.push("/login");
+    const logout = () => {
+      saveAuth({ baseUrl: store.auth.baseUrl, apiKey: "", devToken: "", authMode: "apiKey", account: "" });
+      store.userProfile = null;
+      store.rawSummary = null;
+      store.summary = { domain: [], rca: [], rcs: [], rgpu: [], rgs: [], ssl_order: [] };
+      toast("已退出登录");
+      router.replace("/login");
     };
-
-    async function save() {
-      if (!form.apiKey.trim()) {
-        toast("请填写 X-Api-Key");
-        return;
-      }
-      saveAuth(form);
-      showApiKey.value = false;
-      await refreshSummary(true);
-      toast("已保存");
-    }
 
     function openAbout() {
       showAboutModal.value = true;
@@ -2356,19 +3233,6 @@ const MePage = {
 
     function closeAbout() {
       showAboutModal.value = false;
-    }
-
-    async function copyUpdateUrl() {
-      try {
-        if (navigator.clipboard && navigator.clipboard.writeText) {
-          await navigator.clipboard.writeText(UPDATE_BASE_URL);
-          toast("更新源已复制");
-          return;
-        }
-      } catch {
-        // fallback
-      }
-      window.prompt("复制更新源", UPDATE_BASE_URL);
     }
 
     async function fetchUpdatePayload() {
@@ -2415,7 +3279,7 @@ const MePage = {
           return;
         }
         const target = info.downloadUrl || UPDATE_BASE_URL;
-        const notes = info.notes || "暂无更新说明";
+        const notes = formatUpdateNotesForDialog(info.notes);
         const ok = confirm(`发现新版本 ${info.version}\n当前版本 ${APP_VERSION}\n\n更新说明：\n${notes}\n\n是否立即下载？`);
         if (!ok) return;
         window.open(target, "_blank");
@@ -2429,19 +3293,16 @@ const MePage = {
 
     return {
       summary,
-      form,
+      authInfo,
       userCard,
       avatarUrl,
-      showApiKey,
       showAboutModal,
       appVersion: APP_VERSION,
-      updateBaseUrl: UPDATE_BASE_URL,
       brandLogo: BRAND_LOGO,
-      toggleApiKey,
-      save,
+      goLogin,
+      logout,
       openAbout,
       closeAbout,
-      copyUpdateUrl,
       checkUpdate
     };
   }
@@ -2449,6 +3310,7 @@ const MePage = {
 
 const routes = [
   { path: "/", redirect: "/home" },
+  { path: "/login", component: LoginPage },
   { path: "/home", component: HomePage },
   { path: "/promo", component: PromoPage },
   { path: "/me", component: MePage },
@@ -2463,7 +3325,7 @@ const RootApp = {
   template: `
     <div>
       <div class="global-loading" v-show="loading"></div>
-      <transition name="boot-fade">
+      <transition :css="false" @enter="onBootEnter" @leave="onBootLeave">
         <div v-if="bootVisible" :class="['boot-splash', bootMode === 'progress' ? 'boot-progress-mode' : 'boot-animated-mode']">
           <div class="boot-splash-inner">
             <div class="boot-logo-wrap">
@@ -2477,7 +3339,7 @@ const RootApp = {
         </div>
       </transition>
       <router-view v-slot="{ Component, route }">
-        <transition name="page-slide" mode="out-in">
+        <transition :css="false" @enter="onPageEnter" @leave="onPageLeave">
           <component :is="Component" :key="route.fullPath" />
         </transition>
       </router-view>
@@ -2491,17 +3353,122 @@ const RootApp = {
     const bootMode = ref("animated");
     const reducedMotion = ref(false);
     let progressTimer = null;
+    let bootStartAt = Date.now();
+    let bootClosing = false;
+    const bootExpectedMs = ref(BOOT_EXPECTED_FALLBACK_MS);
+
+    const prefersReducedMotion = () => {
+      if (reducedMotion.value) return true;
+      if (typeof window === "undefined" || !window.matchMedia) return false;
+      return Boolean(window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+    };
+
+    const parseCssPx = (v) => {
+      const n = Number.parseFloat(String(v || "0"));
+      return Number.isFinite(n) ? n : 0;
+    };
+
+    const readNavShift = () => {
+      if (typeof document === "undefined") return { x: 0, y: 0 };
+      const rootStyle = getComputedStyle(document.documentElement);
+      return {
+        x: parseCssPx(rootStyle.getPropertyValue("--nav-shift-x")),
+        y: parseCssPx(rootStyle.getPropertyValue("--nav-shift-y"))
+      };
+    };
+
+    const onBootEnter = (el, done) => {
+      if (prefersReducedMotion()) {
+        el.style.opacity = "1";
+        el.style.transform = "none";
+        done();
+        return;
+      }
+      animate(
+        el,
+        [{ opacity: 0, transform: "translate3d(0, 10px, 0) scale(0.992)" }, { opacity: 1, transform: "translate3d(0, 0, 0) scale(1)" }],
+        { duration: 0.32, easing: "cubic-bezier(.22,1,.36,1)" }
+      ).finished.then(done).catch(done);
+    };
+
+    const onBootLeave = (el, done) => {
+      if (prefersReducedMotion()) {
+        done();
+        return;
+      }
+      animate(
+        el,
+        [{ opacity: 1, transform: "translate3d(0, 0, 0) scale(1)" }, { opacity: 0, transform: "translate3d(0, -8px, 0) scale(0.996)" }],
+        { duration: 0.24, easing: "ease-out" }
+      ).finished.then(done).catch(done);
+    };
+
+    const onPageEnter = (el, done) => {
+      if (prefersReducedMotion()) {
+        el.style.opacity = "1";
+        el.style.transform = "none";
+        done();
+        return;
+      }
+      const shift = readNavShift();
+      animate(
+        el,
+        [
+          { opacity: 0.01, transform: `translate3d(${shift.x}px, ${shift.y}px, 0) scale(0.986)` },
+          { opacity: 1, transform: "translate3d(0, 0, 0) scale(1)" }
+        ],
+        { duration: 0.3, easing: "cubic-bezier(.22,1,.36,1)" }
+      ).finished.then(done).catch(done);
+    };
+
+    const onPageLeave = (el, done) => {
+      if (prefersReducedMotion()) {
+        done();
+        return;
+      }
+      const shift = readNavShift();
+      animate(
+        el,
+        [
+          { opacity: 1, transform: "translate3d(0, 0, 0) scale(1)" },
+          { opacity: 0.01, transform: `translate3d(${(-0.45 * shift.x).toFixed(2)}px, ${(-0.45 * shift.y).toFixed(2)}px, 0) scale(0.994)` }
+        ],
+        { duration: 0.14, easing: "ease-out" }
+      ).finished.then(done).catch(done);
+    };
 
     const tryCloseBoot = () => {
-      if (minBootElapsed.value && !loading.value) {
+      if (!minBootElapsed.value || loading.value || bootClosing) return;
+      bootClosing = true;
+      bootProgress.value = Math.max(bootProgress.value, 97);
+      setTimeout(() => {
         bootProgress.value = 100;
-        setTimeout(() => {
-          bootVisible.value = false;
-        }, 220);
+      }, 40);
+      setTimeout(() => {
+        bootVisible.value = false;
+        writeBootMetrics(Date.now() - bootStartAt);
+      }, 220);
+    };
+
+    const tickBootProgress = () => {
+      if (!bootVisible.value) return;
+      if (bootClosing) return;
+      const elapsed = Date.now() - bootStartAt;
+      const expected = clamp(Number(bootExpectedMs.value) || BOOT_EXPECTED_FALLBACK_MS, BOOT_EXPECTED_MIN_MS, BOOT_EXPECTED_MAX_MS);
+      const ratio = clamp(elapsed / expected, 0, 1);
+      const eased = 1 - ((1 - ratio) ** 2.2);
+      const cap = minBootElapsed.value && !loading.value ? 100 : 96;
+      const base = 4;
+      const target = clamp(base + (cap - base) * eased, base, cap);
+      const next = Math.min(cap, Math.max(bootProgress.value + 0.8, target));
+      if (next > bootProgress.value) {
+        bootProgress.value = Number(next.toFixed(2));
       }
     };
 
     onMounted(() => {
+      bootStartAt = Date.now();
+      bootExpectedMs.value = readBootMetrics().emaMs || BOOT_EXPECTED_FALLBACK_MS;
       if (typeof window !== "undefined" && window.matchMedia) {
         const mql = window.matchMedia("(prefers-reduced-motion: reduce)");
         reducedMotion.value = Boolean(mql.matches);
@@ -2509,20 +3476,11 @@ const RootApp = {
           bootMode.value = "progress";
         }
       }
-      progressTimer = setInterval(() => {
-        if (!bootVisible.value) return;
-        const cap = minBootElapsed.value && !loading.value ? 100 : 94;
-        if (bootProgress.value < cap) {
-          const delta = bootMode.value === "progress"
-            ? (bootProgress.value < 60 ? 2 : 1)
-            : (bootProgress.value < 40 ? 3 : (bootProgress.value < 75 ? 2 : 1));
-          bootProgress.value = Math.min(cap, bootProgress.value + delta);
-        }
-      }, 120);
+      progressTimer = setInterval(tickBootProgress, 80);
       setTimeout(() => {
         minBootElapsed.value = true;
         tryCloseBoot();
-      }, 5000);
+      }, BOOT_MIN_VISIBLE_MS);
     });
 
     watch(loading, () => {
@@ -2536,14 +3494,17 @@ const RootApp = {
       }
     });
 
-    return { loading, bootVisible, bootProgress, bootMode, logo: BRAND_LOGO };
+    return { loading, bootVisible, bootProgress, bootMode, logo: BRAND_LOGO, onBootEnter, onBootLeave, onPageEnter, onPageLeave };
   }
 };
 
 router.beforeEach((to) => {
-  if (!store.auth.apiKey && to.path !== "/me") {
-    toast("请先在“我的”页填写 API Key");
-    return "/me";
+  if (!isAuthenticated() && to.path === "/me") {
+    toast("请先登录");
+    return "/login";
+  }
+  if (isAuthenticated() && to.path === "/login") {
+    return "/home";
   }
   return true;
 });
@@ -2555,7 +3516,7 @@ async function setupAndroidBackHandler() {
     let lastBackAt = 0;
     const isTabRootPath = (path) => {
       const p = String(path || "/");
-      return p === "/" || p === "/home" || p === "/promo" || p === "/me";
+      return p === "/" || p === "/home" || p === "/promo" || p === "/me" || p === "/login";
     };
     const fallbackRouteByPath = (path) => {
       const p = String(path || "/");
