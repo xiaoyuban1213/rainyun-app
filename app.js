@@ -13,7 +13,7 @@ import "@arco-design/web-vue/es/typography/style/css.js";
 
 const BRAND_LOGO = new URL("./assets/icons/app-icon-20260228.jpg", import.meta.url).href;
 const AVATAR = new URL("./assets/images/default-avatar.svg", import.meta.url).href;
-const APP_VERSION = "1.1.3";
+const APP_VERSION = "1.1.4";
 const SEASON_BG_MAP = {
   spring: "https://forum.rainyun.com/uploads/default/original/2X/c/c945ac6e94feae902f54476fd53c65cc74d027fb.webp",
   summer: "https://forum.rainyun.com/uploads/default/original/2X/b/b89be1c923371d70912118bc3038cee6f1f77f0f.webp",
@@ -127,8 +127,10 @@ const RENEW_PRICE_TTL_MS = 2 * 60 * 1000;
 const COUPON_TTL_MS = 60 * 1000;
 const API_REQUEST_CACHE_KEY = "rainyun-api-request-cache";
 const PROMO_DAILY_CACHE_KEY = "rainyun-promo-income-daily-cache";
+const PROMO_RESELL_DETAIL_CACHE_KEY = "rainyun-promo-resell-detail-cache";
 const API_REQUEST_CACHE_LIMIT = 240;
 const PROMO_DAILY_CACHE_LIMIT = 180;
+const PROMO_RESELL_DETAIL_TTL_MS = 5 * 60 * 1000;
 const BOOT_METRICS_KEY = "rainyun-boot-metrics-v1";
 const BOOT_EXPECTED_FALLBACK_MS = 1900;
 const BOOT_EXPECTED_MIN_MS = 1200;
@@ -529,6 +531,83 @@ function readPromoDailySeries() {
     }))
     .filter((x) => /^\d{4}-\d{2}-\d{2}$/.test(x.day) && Number.isFinite(x.totalIncome))
     .sort((a, b) => a.day.localeCompare(b.day));
+}
+
+function promoResellCacheKey() {
+  const base = String(store.auth.baseUrl || "").trim();
+  const apiKey = String(store.auth.apiKey || "").trim();
+  const devToken = String(store.auth.devToken || "").trim();
+  return `${PROMO_RESELL_DETAIL_CACHE_KEY}:${base}|${apiKey}|${devToken}`;
+}
+
+function normalizeResellDetailRows(rows) {
+  const list = Array.isArray(rows) ? rows : [];
+  return list
+    .map((row) => {
+      if (row && typeof row === "object") {
+        const readyTs = Number(row.ts);
+        const readyIncome = Number(row.income);
+        const readyDay = String(row.day || "").trim();
+        if (Number.isFinite(readyTs) && Number.isFinite(readyIncome) && /^\d{4}-\d{2}-\d{2}$/.test(readyDay)) {
+          return {
+            ts: Math.floor(readyTs),
+            day: readyDay,
+            income: readyIncome
+          };
+        }
+      }
+      const tsRaw = pickFirstFieldDeep(row, ["time", "Time", "created_at", "CreateTime", "timestamp"]);
+      const tsNum = Number(tsRaw);
+      const tsMs = Number.isFinite(tsNum) && tsNum > 0
+        ? (tsNum > 1000000000000 ? tsNum : tsNum * 1000)
+        : NaN;
+      if (!Number.isFinite(tsMs)) return null;
+      const points = toNumberOrNull(pickFirstFieldDeep(row, ["points", "Points", "profit_points", "ProfitPoints"]));
+      const income = points !== null ? points / 2000 : null;
+      if (income === null || !Number.isFinite(income)) return null;
+      return {
+        ts: Math.floor(tsMs),
+        day: toDayKey(tsMs),
+        income: Number(income)
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.ts - b.ts);
+}
+
+async function fetchPromoResellDetailRows(options = {}) {
+  const force = Boolean(options.force);
+  const daysBack = Number.isFinite(Number(options.daysBack)) ? Math.max(7, Number(options.daysBack)) : 45;
+  const perPage = 100;
+  const cutoffMs = Date.now() - (daysBack * 86400000);
+  const cacheKey = promoResellCacheKey();
+  const cached = readJsonCache(cacheKey, { at: 0, rows: [] });
+  const cachedRows = normalizeResellDetailRows(cached?.rows);
+  if (!force && Number(cached?.at || 0) > 0 && (Date.now() - Number(cached.at) < PROMO_RESELL_DETAIL_TTL_MS) && cachedRows.length) {
+    return cachedRows;
+  }
+
+  const rows = [];
+  for (let page = 1; page <= 50; page += 1) {
+    const optionsText = encodeURIComponent(JSON.stringify({
+      columnFilters: { "users.id": "" },
+      sort: [],
+      page,
+      perPage
+    }));
+    const payload = await apiGet(`/user/vip/resell_detail?options=${optionsText}`, { force, ttlMs: 15000 });
+    const data = extractPayloadData(payload) || {};
+    const records = Array.isArray(data.Records) ? data.Records : (Array.isArray(data.records) ? data.records : []);
+    if (!records.length) break;
+    const normalized = normalizeResellDetailRows(records);
+    rows.push(...normalized);
+    const minTs = normalized.length ? normalized[0].ts : Number.POSITIVE_INFINITY;
+    if (minTs <= cutoffMs) break;
+    if (records.length < perPage) break;
+  }
+
+  writeJsonCache(cacheKey, { at: Date.now(), rows });
+  return rows;
 }
 
 async function fetchCoupons(options = {}) {
@@ -1545,13 +1624,11 @@ function buildDetailView(kind, id, detailData, monitorData) {
     const eipList = Array.isArray(detailEnvelope.EIPList) ? detailEnvelope.EIPList : (Array.isArray(d.EIPList) ? d.EIPList : []);
     const ipv6 = eipList.find((x) => String(x.Type || "").toLowerCase().includes("ipv6"));
     const showIp = (ipv6 && ipv6.IP) || d.NatPublicIP || d.MainIPv4 || "-";
-    const lineText = String(plan.line || node.IpZone || d.Zone || node.Region || "-");
     const baseInfo = [
       { key: "产品类型", value: kind === "rgpu" ? "显卡云电脑" : "云服务器" },
       { key: "产品ID", value: String(id) },
       { key: "名称", value: d.OsName || d.HostName || "-" },
       { key: "状态", value: d.Status || "-" },
-      { key: "线路", value: lineText },
       { key: "公网IP", value: showIp },
       { key: "配置", value: plan.plan_name || "-" },
       { key: "到期时间", value: expireAt }
@@ -1563,18 +1640,23 @@ function buildDetailView(kind, id, detailData, monitorData) {
       { key: "上行带宽", value: `${String(d.NetIn ?? plan.net_in ?? "-")} Mbps` },
       { key: "下行带宽", value: `${String(d.NetOut ?? plan.net_out ?? "-")} Mbps` },
       { key: "系统", value: d.OsInfo?.chinese_name || d.OsName || "-" },
-      { key: "线路", value: lineText },
       { key: "备份数量", value: `${String(counts.rbs)} 个` },
       { key: "数据盘", value: `${String(counts.eDisk)} 个` },
       { key: "IP数量", value: `${String(counts.ipCount)} 个` },
       { key: "私有网络", value: `${String(counts.vnetCount)} 个` }
     ];
+    const memoryPercent = usage.FreeMem !== undefined && usage.MaxMem !== undefined && Number(usage.MaxMem) > 0
+      ? (Math.max(0, Number(usage.MaxMem) - Number(usage.FreeMem)) / Number(usage.MaxMem)) * 100
+      : (usage.memory_used !== undefined && usage.memory_total !== undefined && Number(usage.memory_total) > 0
+        ? (Number(usage.memory_used) / Number(usage.memory_total)) * 100
+        : null);
     const monitorRows = [
       { key: "CPU(%)", value: usage.CPU === undefined ? "-" : Number(usage.CPU).toFixed(2) },
       {
         key: "内存使用",
+        percent: memoryPercent,
         value: usage.FreeMem !== undefined && usage.MaxMem !== undefined
-          ? `${formatBytes(Math.max(0, usage.MaxMem - usage.FreeMem))} / ${formatBytes(usage.MaxMem)}`
+          ? `${formatBytes(Math.max(0, usage.MaxMem - usage.FreeMem))}`
           : "-"
       },
       { key: "磁盘读速率", value: usage.DiskRead === undefined ? "-" : formatRate(usage.DiskRead) },
@@ -1699,13 +1781,11 @@ function buildDetailView(kind, id, detailData, monitorData) {
       : String(d.OsName || d.HostName || d.Name || "-");
     const gameExpireRaw = pickFirstFieldDeep(d, ["ExpDate", "exp_date", "expired_at", "expire_at", "end_time", "due_time"]);
     const gameExpireAt = formatDateTime(gameExpireRaw) || "-";
-    const lineText = String(plan.line || node.IpZone || d.Zone || node.Region || "-");
     const baseInfo = [
       { key: "产品类型", value: "游戏云" },
       { key: "产品ID", value: String(id) },
       { key: "名称", value: displayName },
       { key: "状态", value: d.Status || "-" },
-      { key: "线路", value: lineText },
       { key: "公网IP", value: isMcsm ? accessHost : showIp },
       { key: "配置", value: plan.chinese || plan.plan_name || d.PlanName || d.Spec || "-" },
       { key: "到期时间", value: gameExpireAt }
@@ -1731,22 +1811,26 @@ function buildDetailView(kind, id, detailData, monitorData) {
           { key: "游戏类型", value: String(gameTitle) },
           { key: "运行镜像", value: String(eggType.mcsm_docker || eggType.docker || "-") },
           { key: "面板账号", value: String(d.McsmUserName || d.McsmUser?.name || "-") },
-          { key: "实例UUID", value: String(d.ServerUUID || d.DaemonUUID || "-") },
-          { key: "线路", value: lineText }
+          { key: "实例UUID", value: String(d.ServerUUID || d.DaemonUUID || "-") }
         ]
       : [
           ...commonRows,
-          { key: "系统", value: d.OsInfo?.chinese_name || d.OsName || "-" },
-          { key: "线路", value: lineText }
+          { key: "系统", value: d.OsInfo?.chinese_name || d.OsName || "-" }
         ];
+    const memoryPercent = usage.FreeMem !== undefined && usage.MaxMem !== undefined && Number(usage.MaxMem) > 0
+      ? (Math.max(0, Number(usage.MaxMem) - Number(usage.FreeMem)) / Number(usage.MaxMem)) * 100
+      : (usage.memory_used !== undefined && usage.memory_total !== undefined && Number(usage.memory_total) > 0
+        ? (Number(usage.memory_used) / Number(usage.memory_total)) * 100
+        : null);
     const monitorRows = [
       { key: "CPU(%)", value: usage.CPU === undefined ? "-" : Number(usage.CPU).toFixed(2) },
       {
         key: "内存使用",
+        percent: memoryPercent,
         value: usage.FreeMem !== undefined && usage.MaxMem !== undefined
-          ? `${formatBytes(Math.max(0, usage.MaxMem - usage.FreeMem))} / ${formatBytes(usage.MaxMem)}`
+          ? `${formatBytes(Math.max(0, usage.MaxMem - usage.FreeMem))}`
           : (usage.memory_used !== undefined && usage.memory_total !== undefined
-            ? `${formatBytes(usage.memory_used)} / ${formatBytes(usage.memory_total)}`
+            ? `${formatBytes(usage.memory_used)}`
             : "-")
       },
       { key: "磁盘读速率", value: usage.DiskRead === undefined ? "-" : formatRate(usage.DiskRead) },
@@ -1966,6 +2050,7 @@ const MobileShell = {
     const mainClass = computed(() => {
       const classes = ["m-main"];
       if (route.path === "/home") classes.push("m-main-home");
+      if (/^\/product\/[^/]+\/[^/]+$/.test(String(route.path || ""))) classes.push("m-main-detail");
       return classes;
     });
     const avatar = computed(() => {
@@ -2174,7 +2259,7 @@ const TodoPage = {
 
       <section class="panel" v-else-if="type === 'renew'">
         <div v-if="!renewRows.length" class="empty">暂无待续费数据</div>
-        <div v-else class="todo-list">
+        <div v-else class="todo-list renew-list">
           <div class="todo-item" v-for="row in renewRows" :key="'r-' + row.kind + '-' + row.id">
             <b>{{ row.name }}</b>
             <span>{{ row.kindLabel }} #{{ row.id }} · {{ row.statusText }}</span>
@@ -2187,7 +2272,7 @@ const TodoPage = {
 
       <section class="panel" v-else-if="type === 'coupon'">
         <div v-if="!couponRows.length" class="empty">暂无可用优惠券</div>
-        <div v-else class="todo-list">
+        <div v-else class="todo-list coupon-list">
           <div class="todo-item" v-for="row in couponRows" :key="'c-' + row.id">
             <b>{{ row.name }}</b>
             <span>{{ row.typeText }} · {{ row.valueText }} · {{ row.expireText }}</span>
@@ -2374,16 +2459,20 @@ const ProductListPage = {
               </div>
               <div class="detail-card-sub">{{ getCardMeta(id).nodeText }}</div>
               <div class="detail-card-kv">
-                <span>IP {{ getCardMeta(id).ipText }}</span>
-                <span>到期 {{ getCardMeta(id).expireText }}</span>
+                <span>IP：{{ getCardMeta(id).ipText }}</span>
+                <span>到期：{{ getCardMeta(id).expireText }}</span>
               </div>
               <div class="detail-card-bars" v-if="getCardMeta(id).showMetrics">
                 <div class="mini-metric">
-                  <span>CPU {{ getCardMeta(id).cpuText }}</span>
+                  <div class="mini-metric-line">
+                    <span class="metric-inline">CPU：{{ getCardMeta(id).cpuPercentText }}</span>
+                  </div>
                   <i><em :style="{ width: getCardMeta(id).cpuBarPercent + '%' }"></em></i>
                 </div>
                 <div class="mini-metric">
-                  <span>内存 {{ getCardMeta(id).memText }}</span>
+                  <div class="mini-metric-line">
+                    <span class="metric-inline">内存：{{ getCardMeta(id).memPercentText }}</span>
+                  </div>
                   <i><em :style="{ width: getCardMeta(id).memBarPercent + '%' }"></em></i>
                 </div>
               </div>
@@ -2437,6 +2526,11 @@ const ProductListPage = {
       if (v < 6) return 6;
       return Math.max(0, Math.min(100, v));
     };
+    const formatPercentText = (v) => {
+      const n = Number(v);
+      if (!Number.isFinite(n)) return "-";
+      return `${formatFixed2(Math.max(0, Math.min(100, n)))}%`;
+    };
     const parseMemPercent = (text) => {
       const s = String(text || "");
       const m = s.match(/([0-9.]+)\s*([KMGTP]?B)\s*\/\s*([0-9.]+)\s*([KMGTP]?B)/i);
@@ -2464,6 +2558,39 @@ const ProductListPage = {
       const m = s.match(/(\d{4}[-\/]\d{1,2}[-\/]\d{1,2})/);
       return m ? m[1].replace(/\//g, "-") : s;
     };
+    const parseIPv4 = (text) => {
+      const s = String(text || "");
+      const m = s.match(/\b(?:\d{1,3}\.){3}\d{1,3}\b/);
+      if (!m) return "";
+      const ip = String(m[0]);
+      const ok = ip.split(".").every((x) => {
+        const n = Number(x);
+        return Number.isInteger(n) && n >= 0 && n <= 255;
+      });
+      return ok ? ip : "";
+    };
+    const pickCardIp = (detailData, fallback) => {
+      const direct = pickFirstFieldDeep(detailData, [
+        "MainIPv4", "main_ipv4", "NatPublicIP", "nat_public_ip", "PublicIPv4", "public_ipv4",
+        "PublicIP", "public_ip", "MainIP", "main_ip", "IP", "ip"
+      ]);
+      const ipv4FromDirect = parseIPv4(direct);
+      if (ipv4FromDirect) return ipv4FromDirect;
+      const ipv4FromFallback = parseIPv4(fallback);
+      if (ipv4FromFallback) return ipv4FromFallback;
+      return String(fallback || "-");
+    };
+    const formatCardIp = (raw) => {
+      const s = String(raw || "").trim();
+      if (!s || s === "-") return "-";
+      if (s.includes(":") && s.length > 18) {
+        return `${s.slice(0, 9)}...${s.slice(-6)}`;
+      }
+      if (s.length > 22) {
+        return `${s.slice(0, 11)}...${s.slice(-7)}`;
+      }
+      return s;
+    };
     const toCardMeta = (id, detailPayload) => {
       const detailData = extractPayloadData(detailPayload);
       const view = buildDetailView(kind.value, id, detailData, null) || {};
@@ -2479,10 +2606,12 @@ const ProductListPage = {
         statusText: status.statusText,
         statusClass: status.statusClass,
         nodeText: String(info.node || "-"),
-        ipText: String(info.remoteIp || "-"),
+        ipText: formatCardIp(pickCardIp(detailData, String(info.remoteIp || "-"))),
         expireText: parseExpireBrief(String(info.expireAt || "-")),
         cpuText,
         memText,
+        cpuPercentText: formatPercentText(cpuPercent),
+        memPercentText: formatPercentText(memPercent),
         cpuPercent,
         memPercent,
         cpuBarPercent: toBarPercent(cpuPercent),
@@ -2502,6 +2631,8 @@ const ProductListPage = {
         expireText: "-",
         cpuText: "-",
         memText: "-",
+        cpuPercentText: "-",
+        memPercentText: "-",
         cpuPercent: 0,
         memPercent: 0,
         cpuBarPercent: 0,
@@ -2583,115 +2714,121 @@ const ProductDetailPage = {
   components: { MobileShell },
   template: `
     <MobileShell :title="kindLabel + '详情'">
-      <section class="panel" v-if="loading">
+      <section class="panel detail-main-panel" v-if="loading">
         <a-typography-text class="muted" type="secondary">正在加载详情...</a-typography-text>
       </section>
 
-      <section class="panel" v-else-if="errorText">
+      <section class="panel detail-main-panel" v-else-if="errorText">
         <p class="error-text">{{ errorText }}</p>
       </section>
 
-      <section class="panel" v-else>
-        <div class="panel-title">
-          <a-typography-title :heading="6" class="typo-title">{{ (kind === 'rcs' || kind === 'rgpu' || kind === 'rgs') ? '服务器信息' : (kind === 'rca' ? '应用信息' : '基础状态') }}</a-typography-title>
-          <a-typography-text class="panel-subtext" type="secondary">{{ detailPath || '--' }}</a-typography-text>
-        </div>
-        <div v-if="kind === 'rcs' || kind === 'rgpu' || kind === 'rgs' || kind === 'rca'" class="server-info-list">
-          <div class="server-row"><span>{{ kind === 'rca' ? '项目 ID' : '服务器 ID' }}</span><b>{{ serverInfo.id }}</b></div>
-          <div class="server-row"><span>标签</span><b>{{ serverInfo.tag }}</b></div>
-          <div class="server-row">
-            <span>运行状态</span>
-            <b :class="['state-badge', statusView.className]">
-              <i :class="statusView.icon"></i>{{ statusView.label }}
-            </b>
-          </div>
-          <div class="server-row"><span>{{ kind === 'rca' ? '区域' : '节点' }}</span><b>{{ serverInfo.node }}</b></div>
-          <div class="server-row"><span>到期日期</span><b>{{ serverInfo.expireAt }}</b></div>
-          <div class="server-row" v-if="serverInfo.showTraffic"><span>剩余流量</span><b>{{ serverInfo.trafficLeft }}</b></div>
-          <div v-if="canOperatePower" class="remote-info-block">
-            <div class="server-row server-row-remote">
-              <span>公网 IP 地址</span>
-              <div class="remote-cell">
-                <b>{{ serverInfo.remoteIp || '-' }}</b>
-                <button class="remote-action-btn" @click="copyRemoteIp">复制</button>
+      <div class="detail-layout" v-else>
+        <div class="detail-layout-main">
+          <section class="panel detail-main-panel">
+            <div class="panel-title">
+              <a-typography-title :heading="6" class="typo-title">{{ (kind === 'rcs' || kind === 'rgpu' || kind === 'rgs') ? '服务器信息' : (kind === 'rca' ? '应用信息' : '基础状态') }}</a-typography-title>
+              <a-typography-text class="panel-subtext" type="secondary">{{ detailPath || '--' }}</a-typography-text>
+            </div>
+            <div v-if="kind === 'rcs' || kind === 'rgpu' || kind === 'rgs' || kind === 'rca'" class="server-info-list">
+              <div class="server-row"><span>{{ kind === 'rca' ? '项目 ID' : '服务器 ID' }}</span><b>{{ serverInfo.id }}</b></div>
+              <div class="server-row"><span>标签</span><b>{{ serverInfo.tag }}</b></div>
+              <div class="server-row">
+                <span>运行状态</span>
+                <b :class="['state-badge', statusView.className]">
+                  <i :class="statusView.icon"></i>{{ statusView.label }}
+                </b>
+              </div>
+              <div class="server-row"><span>{{ kind === 'rca' ? '区域' : '节点' }}</span><b>{{ serverInfo.node }}</b></div>
+              <div class="server-row"><span>到期日期</span><b>{{ serverInfo.expireAt }}</b></div>
+              <div class="server-row" v-if="serverInfo.showTraffic"><span>剩余流量</span><b>{{ serverInfo.trafficLeft }}</b></div>
+              <div v-if="canOperatePower" class="remote-info-block">
+                <div class="server-row server-row-remote">
+                  <span>公网 IP 地址</span>
+                  <div class="remote-cell">
+                    <b>{{ serverInfo.remoteIp || '-' }}</b>
+                    <button class="remote-action-btn" @click="copyRemoteIp">复制</button>
+                  </div>
+                </div>
+                <div class="server-row server-row-remote">
+                  <span>远程用户名</span>
+                  <div class="remote-cell">
+                    <b>{{ serverInfo.remoteUser || '-' }}</b>
+                    <button class="remote-action-btn" @click="copyRemoteUser">复制</button>
+                  </div>
+                </div>
+                <div class="server-row server-row-remote">
+                  <span>远程密码</span>
+                  <div class="remote-cell">
+                    <b>{{ remotePasswordText }}</b>
+                    <button class="remote-action-btn" @click="copyRemotePassword">复制</button>
+                    <button class="remote-action-btn" @click="toggleRemotePassword">{{ remotePasswordVisible ? '隐藏' : '查看' }}</button>
+                  </div>
+                </div>
               </div>
             </div>
-            <div class="server-row server-row-remote">
-              <span>远程用户名</span>
-              <div class="remote-cell">
-                <b>{{ serverInfo.remoteUser || '-' }}</b>
-                <button class="remote-action-btn" @click="copyRemoteUser">复制</button>
+            <div v-if="canOperatePower" class="detail-quick-actions">
+              <div class="panel-title mini">
+                <a-typography-title :heading="6" class="typo-title">快速操作</a-typography-title>
+                <a-typography-text class="panel-subtext" type="secondary">服务器控制与远程连接</a-typography-text>
+              </div>
+              <div class="action-grid quick-actions-grid">
+                <a-button class="line-btn op-neutral" size="medium" type="outline" @click="copyProductId">复制ID</a-button>
+                <a-button class="line-btn op-start" size="medium" type="outline" @click="startServer">开机</a-button>
+                <a-button class="line-btn op-reboot" size="medium" type="outline" @click="rebootServer">重启</a-button>
+                <a-button class="line-btn op-stop" size="medium" type="outline" @click="stopServer">关机</a-button>
+                <a-button v-if="showBtPanelButton" class="line-btn op-panel" size="medium" type="outline" @click="openBtPanel">宝塔面板</a-button>
+                <a-button v-if="showXtermButton" class="line-btn op-console" size="medium" type="outline" :disabled="vncLoading" @click="openVnc('xtermjs')">Xtermjs</a-button>
+                <a-button class="line-btn op-console" size="medium" type="outline" :disabled="vncLoading" @click="openVnc('novnc')">NoVNC</a-button>
+              </div>
+              <div v-if="vncLoading" class="vnc-loading-tip">正在获取 VNC 地址...</div>
+              <div v-if="opLoading" class="vnc-loading-tip">正在执行操作...</div>
+              <div v-if="opErrorText" class="vnc-loading-tip is-error">{{ opErrorText }}</div>
+              <div v-if="opApiPath" class="detail-op-path">
+                <a-typography-text class="panel-subtext" type="secondary">控制接口：{{ opApiPath }}</a-typography-text>
               </div>
             </div>
-            <div class="server-row server-row-remote">
-              <span>远程密码</span>
-              <div class="remote-cell">
-                <b>{{ remotePasswordText }}</b>
-                <button class="remote-action-btn" @click="copyRemotePassword">复制</button>
-                <button class="remote-action-btn" @click="toggleRemotePassword">{{ remotePasswordVisible ? '隐藏' : '查看' }}</button>
+            <div v-else class="detail-metrics">
+              <div class="metric-item" v-for="row in baseInfo" :key="'base-' + row.key">
+                <span>{{ row.key }}</span>
+                <b>{{ row.value }}</b>
               </div>
             </div>
-          </div>
+          </section>
         </div>
-        <div v-if="canOperatePower" class="detail-quick-actions">
-          <div class="panel-title mini">
-            <a-typography-title :heading="6" class="typo-title">快速操作</a-typography-title>
-            <a-typography-text class="panel-subtext" type="secondary">服务器控制与远程连接</a-typography-text>
-          </div>
-          <div class="action-grid quick-actions-grid">
-            <a-button class="line-btn op-neutral" size="medium" type="outline" @click="copyProductId">复制ID</a-button>
-            <a-button class="line-btn op-start" size="medium" type="outline" @click="startServer">开机</a-button>
-            <a-button class="line-btn op-neutral" size="medium" type="outline" @click="rebootServer">重启</a-button>
-            <a-button class="line-btn op-stop" size="medium" type="outline" @click="stopServer">关机</a-button>
-            <a-button v-if="showBtPanelButton" class="line-btn op-panel" size="medium" type="outline" @click="openBtPanel">宝塔面板</a-button>
-            <a-button v-if="showXtermButton" class="line-btn op-console" size="medium" type="outline" :disabled="vncLoading" @click="openVnc('xtermjs')">Xtermjs</a-button>
-            <a-button class="line-btn op-console" size="medium" type="outline" :disabled="vncLoading" @click="openVnc('novnc')">NoVNC</a-button>
-          </div>
-          <div v-if="vncLoading" class="vnc-loading-tip">正在获取 VNC 地址...</div>
-          <div v-if="opLoading" class="vnc-loading-tip">正在执行操作...</div>
-          <div v-if="opErrorText" class="vnc-loading-tip is-error">{{ opErrorText }}</div>
-          <div v-if="opApiPath" class="detail-op-path">
-            <a-typography-text class="panel-subtext" type="secondary">控制接口：{{ opApiPath }}</a-typography-text>
-          </div>
-        </div>
-        <div v-else class="detail-metrics">
-          <div class="metric-item" v-for="row in baseInfo" :key="'base-' + row.key">
-            <span>{{ row.key }}</span>
-            <b>{{ row.value }}</b>
-          </div>
-        </div>
-      </section>
 
-      <section class="panel" v-if="!loading && !errorText">
-        <div class="panel-title">
-          <a-typography-title :heading="6" class="typo-title">配置信息</a-typography-title>
-          <a-typography-text class="panel-subtext" type="secondary">{{ detailPath || '--' }}</a-typography-text>
-        </div>
-        <div class="kv" v-for="row in configRows" :key="'cfg-' + row.key + row.value">
-          <span>{{ row.key }}</span><b>{{ row.value }}</b>
-        </div>
-      </section>
-
-      <section class="panel" v-if="monitorPath">
-        <div class="panel-title">
-          <a-typography-title :heading="6" class="typo-title">监控信息</a-typography-title>
-          <a-typography-text class="panel-subtext" type="secondary">{{ monitorPath }}</a-typography-text>
-        </div>
-        <div v-if="monitorChartRows.length" class="monitor-chart-list">
-          <div class="monitor-chart-item" v-for="row in monitorChartRows" :key="'m-' + row.key">
-            <div class="monitor-chart-head">
-              <span>{{ row.label }}</span>
-              <b>{{ row.value }}</b>
+        <div class="detail-layout-side">
+          <section class="panel detail-config-panel">
+            <div class="panel-title">
+              <a-typography-title :heading="6" class="typo-title">配置信息</a-typography-title>
+              <a-typography-text class="panel-subtext" type="secondary">{{ detailPath || '--' }}</a-typography-text>
             </div>
-            <div class="monitor-chart-bar">
-              <i :style="{ width: row.percent + '%' }"></i>
+            <div class="kv" v-for="row in configRows" :key="'cfg-' + row.key + row.value">
+              <span>{{ row.key }}</span><b>{{ row.value }}</b>
             </div>
-          </div>
-        </div>
-        <a-typography-text class="muted" type="secondary" v-else>该产品暂未返回监控指标</a-typography-text>
-      </section>
+          </section>
 
-      <section class="panel action-grid">
+          <section class="panel detail-monitor-panel" v-if="monitorPath">
+            <div class="panel-title">
+              <a-typography-title :heading="6" class="typo-title">监控信息</a-typography-title>
+              <a-typography-text class="panel-subtext" type="secondary">{{ monitorPath }}</a-typography-text>
+            </div>
+            <div v-if="monitorChartRows.length" class="monitor-chart-list">
+              <div class="monitor-chart-item" v-for="row in monitorChartRows" :key="'m-' + row.key">
+                <div class="monitor-chart-head">
+                  <span>{{ row.label }}</span>
+                  <b>{{ row.value }}</b>
+                </div>
+                <div class="monitor-chart-bar">
+                  <i :style="{ width: row.percent + '%' }"></i>
+                </div>
+              </div>
+            </div>
+            <a-typography-text class="muted" type="secondary" v-else>该产品暂未返回监控指标</a-typography-text>
+          </section>
+        </div>
+      </div>
+
+      <section class="panel action-grid detail-refresh-panel">
         <a-button class="line-btn" size="medium" type="outline" @click="goList">返回列表</a-button>
         <a-button class="line-btn" size="medium" type="outline" @click="loadDetail">刷新数据</a-button>
         <a-typography-text class="panel-subtext detail-auto-refresh-text" type="secondary">{{ autoRefreshText }}</a-typography-text>
@@ -2911,7 +3048,8 @@ const ProductDetailPage = {
       const parsed = rows.map((row) => {
         const key = String(row.key || "-");
         const value = String(row.value ?? "-");
-        const p = percentByKey(key, value);
+        const customPercent = row && row.percent !== undefined && row.percent !== null ? Number(row.percent) : null;
+        const p = Number.isFinite(customPercent) ? Math.max(0, Math.min(100, customPercent)) : percentByKey(key, value);
         const n = parseFirstNumber(value);
         return { key, label: monitorLabel(key), value, typedPercent: p, numeric: n !== null ? Math.abs(n) : null };
       });
@@ -2942,17 +3080,25 @@ const ProductDetailPage = {
     if (kindName === "rcs") {
       return {
         detail: `/product/rcs/${productId}/`,
-        monitor: "",
+        monitor: `/product/rcs/${productId}/monitor`,
         detailCandidates: [],
-        monitorCandidates: []
+        monitorCandidates: [
+          `/product/rcs/${productId}/metrics`,
+          `/product/rcs/${productId}/monitor?range=1h`,
+          `/product/rcs/${productId}/monitor?step=60`
+        ]
       };
     }
     if (kindName === "rgpu") {
       return {
         detail: `/product/rcs/${productId}/`,
-        monitor: "",
+        monitor: `/product/rcs/${productId}/monitor`,
         detailCandidates: [],
-        monitorCandidates: []
+        monitorCandidates: [
+          `/product/rcs/${productId}/metrics`,
+          `/product/rcs/${productId}/monitor?range=1h`,
+          `/product/rcs/${productId}/monitor?step=60`
+        ]
       };
     }
       if (kindName === "rgs") {
@@ -3420,12 +3566,12 @@ const PromoPage = {
             <button class="about-close" @click="closeDailyReport"><i class="fa-solid fa-xmark"></i></button>
           </div>
           <div class="promo-report-meta">
-            <span>数据来源：<code>/user/</code></span>
+            <span>数据来源：<code>{{ dailyReport.source }}</code></span>
             <span>分析时间：{{ dailyReport.generatedAt }}</span>
           </div>
           <div class="promo-report-kv">
-            <div><b>{{ dailyReport.todayIncome }}</b><span>今日收益</span></div>
-            <div><b>{{ dailyReport.yesterdayIncome }}</b><span>昨日收益</span></div>
+            <div><b>{{ dailyReport.todayIncome }}</b><span>{{ dailyReport.todayIncomeLabel }}</span></div>
+            <div><b>{{ dailyReport.yesterdayIncome }}</b><span>{{ dailyReport.yesterdayIncomeLabel }}</span></div>
             <div><b>{{ dailyReport.avgDaily }}</b><span>本月日均</span></div>
             <div><b>{{ dailyReport.avg7d }}</b><span>近7日日均</span></div>
             <div><b>{{ dailyReport.sum7d }}</b><span>近7日累计</span></div>
@@ -3458,8 +3604,11 @@ const PromoPage = {
     const profile = computed(() => store.userProfile || {});
     const showDailyReport = ref(false);
     const dailyReport = ref({
+      source: "/user/",
       todayIncome: "-",
+      todayIncomeLabel: "今日收益",
       yesterdayIncome: "-",
+      yesterdayIncomeLabel: "昨日收益",
       avgDaily: "-",
       avg7d: "-",
       sum7d: "-",
@@ -3644,11 +3793,16 @@ const PromoPage = {
       }
       await copyLink();
     }
-    function buildDailyIncomeReport() {
-      const now = new Date();
-      const monthIncome = Math.max(0, Number(promo.value.monthIncomeRaw || 0));
-      const prevMonthIncome = Math.max(0, Number(promo.value.prevMonthIncomeRaw || 0));
-      const todayIncome = Math.max(0, Number(promo.value.todayIncomeRaw || 0));
+    function buildDailyIncomeReportFromSeries({
+      now,
+      monthIncome,
+      prevMonthIncome,
+      todayIncome,
+      series,
+      source,
+      note,
+      mode = "cumulative"
+    }) {
       const dayIndex = Math.max(1, now.getDate());
       const daysInMonth = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
       const avgDaily = monthIncome / dayIndex;
@@ -3659,7 +3813,6 @@ const PromoPage = {
 
       const beforeTodayDays = Math.max(1, dayIndex - 1);
       const estBeforeToday = Math.max(0, (monthIncome - todayIncome) / beforeTodayDays);
-      const series = readPromoDailySeries();
       const totalByDay = new Map(series.map((x) => [x.day, x.totalIncome]));
       const rows = [];
       for (let i = 6; i >= 0; i -= 1) {
@@ -3672,7 +3825,10 @@ const PromoPage = {
         const prevTotal = totalByDay.get(prevDay);
         let incomeValue = 0;
         let tag = "推算";
-        if (isToday) {
+        if (mode === "daily") {
+          incomeValue = Number(currTotal || 0);
+          tag = "明细";
+        } else if (isToday) {
           incomeValue = todayIncome;
           tag = "实时";
         } else if (Number.isFinite(currTotal) && Number.isFinite(prevTotal)) {
@@ -3693,8 +3849,10 @@ const PromoPage = {
         });
       }
 
-      const historyRows = rows.filter((x) => x.tag !== "实时");
-      const measuredRows = historyRows.filter((x) => x.tag === "缓存实测" || x.tag === "缓存首日");
+      const historyRows = rows.filter((x) => x.tag !== "实时" && x.tag !== "明细");
+      const measuredRows = mode === "daily"
+        ? rows.filter((x) => x.tag === "明细")
+        : historyRows.filter((x) => x.tag === "缓存实测" || x.tag === "缓存首日");
       const estimatedRows = historyRows.filter((x) => x.tag === "推算");
       const yRow = rows[rows.length - 2] || null;
       const sum7dValue = rows.reduce((sum, x) => sum + Number(x.value || 0), 0);
@@ -3708,15 +3866,40 @@ const PromoPage = {
       const coverageStart = series.length ? series[0].day : "";
       const coverageEnd = series.length ? series[series.length - 1].day : "";
       const coverage = coverageStart && coverageEnd ? `${coverageStart} ~ ${coverageEnd}` : "暂无";
-      const confidenceRate = historyRows.length > 0 ? (measuredRows.length / historyRows.length) : 0;
+      const confidenceRate = mode === "daily"
+        ? 1
+        : (historyRows.length > 0 ? (measuredRows.length / historyRows.length) : 0);
       let confidence = "低";
       if (confidenceRate >= 0.8) confidence = "高";
       else if (confidenceRate >= 0.4) confidence = "中";
 
-      const hasRealRows = rows.some((x) => x.tag === "缓存实测" || x.tag === "缓存首日");
+      const hasRealRows = rows.some((x) => x.tag !== "推算");
+      let todayIncomeLabel = "今日收益";
+      let yesterdayIncomeLabel = "昨日收益";
+      let displayTodayIncome = todayIncome;
+      let displayYesterdayIncome = yRow ? Number(yRow.value || 0) : 0;
+      if (mode === "daily" && Number(displayTodayIncome) <= 0 && Number(displayYesterdayIncome) <= 0) {
+        const nonZeroRows = rows.filter((x) => Number(x.value || 0) > 0);
+        if (nonZeroRows.length >= 1) {
+          const latest = nonZeroRows[nonZeroRows.length - 1];
+          displayTodayIncome = Number(latest.value || 0);
+          todayIncomeLabel = `最近入账(${latest.date})`;
+        }
+        if (nonZeroRows.length >= 2) {
+          const prev = nonZeroRows[nonZeroRows.length - 2];
+          displayYesterdayIncome = Number(prev.value || 0);
+          yesterdayIncomeLabel = `上一入账(${prev.date})`;
+        } else if (nonZeroRows.length >= 1) {
+          displayYesterdayIncome = 0;
+          yesterdayIncomeLabel = "上一入账";
+        }
+      }
       dailyReport.value = {
-        todayIncome: `¥ ${formatFixed2(todayIncome)}`,
-        yesterdayIncome: yRow ? `¥ ${formatFixed2(yRow.value || 0)}` : "-",
+        source,
+        todayIncome: `¥ ${formatFixed2(displayTodayIncome)}`,
+        todayIncomeLabel,
+        yesterdayIncome: `¥ ${formatFixed2(displayYesterdayIncome)}`,
+        yesterdayIncomeLabel,
         avgDaily: `¥ ${formatFixed2(avgDaily)}`,
         avg7d: `¥ ${formatFixed2(avg7dValue)}`,
         sum7d: `¥ ${formatFixed2(sum7dValue)}`,
@@ -3729,18 +3912,70 @@ const PromoPage = {
         measuredDays: measuredRows.length,
         estimatedDays: estimatedRows.length,
         generatedAt: now.toLocaleString(),
-        note: hasRealRows
+        note: note || (hasRealRows
           ? "说明：已启用本地请求缓存，历史日收益优先使用缓存实测差值；缺失日期回退推算。"
-          : "说明：当前暂无足够历史缓存，近7天收益暂按本月累计收益推算，后续会逐步变为实测。",
+          : "说明：当前暂无足够历史缓存，近7天收益暂按本月累计收益推算，后续会逐步变为实测。"),
         rows
       };
     }
-    function openDailyReport() {
-      buildDailyIncomeReport();
+
+    async function buildDailyIncomeReport(options = {}) {
+      const force = Boolean(options.force);
+      const now = new Date();
+      try {
+        const detailRows = await fetchPromoResellDetailRows({ force, daysBack: 60 });
+        if (detailRows.length) {
+          const map = new Map();
+          for (const row of detailRows) {
+            map.set(row.day, Number((Number(map.get(row.day) || 0) + Number(row.income || 0)).toFixed(4)));
+          }
+          const monthPrefix = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-`;
+          let monthIncome = 0;
+          for (const [day, value] of map.entries()) {
+            if (String(day).startsWith(monthPrefix)) monthIncome += Number(value || 0);
+          }
+          const todayIncome = Number(map.get(toDayKey(now)) || 0);
+          const prevMonthIncome = Math.max(0, Number(promo.value.prevMonthIncomeRaw || 0));
+          const series = Array.from(map.entries())
+            .map(([day, total]) => ({ day, totalIncome: Number(total) }))
+            .sort((a, b) => String(a.day).localeCompare(String(b.day)));
+          buildDailyIncomeReportFromSeries({
+            now,
+            monthIncome: Math.max(0, monthIncome),
+            prevMonthIncome,
+            todayIncome,
+            series,
+            source: "/user/vip/resell_detail",
+            note: "说明：已按收益明细逐条聚合计算日收益（仅使用 points 字段，按 1 元 = 2000 积分换算）。",
+            mode: "daily"
+          });
+          return;
+        }
+      } catch (e) {
+        reportLog("WARN", "promo_detail_report_error", { error: String(e) });
+      }
+
+      const monthIncome = Math.max(0, Number(promo.value.monthIncomeRaw || 0));
+      const prevMonthIncome = Math.max(0, Number(promo.value.prevMonthIncomeRaw || 0));
+      const todayIncome = Math.max(0, Number(promo.value.todayIncomeRaw || 0));
+      const series = readPromoDailySeries();
+      buildDailyIncomeReportFromSeries({
+        now,
+        monthIncome,
+        prevMonthIncome,
+        todayIncome,
+        series,
+        source: "/user/",
+        note: "说明：收益明细接口暂不可用，当前使用用户中心缓存口径计算。"
+      });
+    }
+
+    async function openDailyReport() {
+      await buildDailyIncomeReport({ force: false });
       showDailyReport.value = true;
     }
-    function refreshDailyReport() {
-      buildDailyIncomeReport();
+    async function refreshDailyReport() {
+      await buildDailyIncomeReport({ force: true });
       toast("分析已更新");
     }
     function closeDailyReport() {

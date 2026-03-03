@@ -38,14 +38,35 @@ function getConfig(name, options = {}) {
   return String(defaultValue).trim();
 }
 
-function readVersionFromAppJs() {
+function readVersionFromPackageJson() {
+  const file = path.join(ROOT, "package.json");
+  if (!fs.existsSync(file)) {
+    throw new Error("未找到 package.json");
+  }
+  let parsed = null;
+  try {
+    parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch (e) {
+    throw new Error(`无法解析 package.json: ${String(e)}`);
+  }
+  const version = String(parsed?.version || "").trim();
+  if (!version) {
+    throw new Error("package.json 未设置 version");
+  }
+  return version;
+}
+
+function syncAppJsVersion(version) {
   const file = path.join(ROOT, "app.js");
   const code = fs.readFileSync(file, "utf8");
-  const m = code.match(/const\s+APP_VERSION\s*=\s*"([^"]+)"/);
-  if (!m) {
-    throw new Error("无法从 app.js 读取 APP_VERSION");
+  const next = code.replace(
+    /const\s+APP_VERSION\s*=\s*"[^"]+";/,
+    `const APP_VERSION = "${version}";`
+  );
+  if (next !== code) {
+    fs.writeFileSync(file, next, "utf8");
+    console.log(`[ok] 已同步 app.js APP_VERSION -> ${version}`);
   }
-  return m[1];
 }
 
 function run(cmd, cwd = ROOT) {
@@ -148,6 +169,22 @@ function buildAutoReleaseNotes(version) {
   }
 }
 
+function resolveReleaseNotes({ version, configuredReleaseNotes, existingLatest }) {
+  const configured = String(configuredReleaseNotes || "").trim();
+  if (configured) {
+    console.log("[info] 发布日志来源: RELEASE_NOTES");
+    return configured;
+  }
+  const currentVersionInLatest = String(existingLatest?.version || "").trim();
+  const notesInLatest = String(existingLatest?.notes || "").trim();
+  if (currentVersionInLatest === version && notesInLatest) {
+    console.log("[info] 发布日志来源: latest.json 当前版本 notes");
+    return notesInLatest;
+  }
+  console.log("[info] 发布日志来源: git log 自动生成");
+  return buildAutoReleaseNotes(version);
+}
+
 async function uploadToS3({ endpoint, region, bucket, accessKeyId, secretAccessKey, forcePathStyle, key, filePath, contentType }) {
   const client = new S3Client({
     endpoint,
@@ -234,11 +271,15 @@ async function publishGitHubRelease({
   sha256,
   buildTime
 }) {
-  const tagTemplate = getConfig("GITHUB_TAG_NAME", { defaultValue: "v{version}" });
+  const tagTemplate = getConfig("GITHUB_TAG_NAME", { defaultValue: "{version}" });
   const releaseNameTemplate = getConfig("GITHUB_RELEASE_NAME", { defaultValue: "RainYun-App-v{version}-release" });
-  const tagName = resolveTemplate(tagTemplate, { version }) || `v${version}`;
+  const configuredTag = resolveTemplate(tagTemplate, { version });
+  const tagName = configuredTag && configuredTag.includes(version) ? configuredTag : version;
   const releaseName = resolveTemplate(releaseNameTemplate, { version }) || `RainYun-App-v${version}-release`;
   const makeLatest = String(getConfig("GITHUB_RELEASE_LATEST", { defaultValue: "true" })).toLowerCase() !== "false";
+  if (configuredTag && configuredTag !== tagName) {
+    console.log(`[warn] GITHUB_TAG_NAME=${configuredTag} 未包含版本号，已回退为 ${tagName}`);
+  }
   const body = `${version} 发布日志` + "\n\n" + `${releaseNotes}` + "\n\n" + `- sha256: ${sha256}` + "\n" + `- buildTime: ${buildTime}`;
 
   let release = null;
@@ -304,9 +345,12 @@ async function publishGitHubRelease({
 }
 
 async function main() {
-  const version = readVersionFromAppJs();
+  const version = readVersionFromPackageJson();
+  syncAppJsVersion(version);
   const apkName = `RainYun-App-v${version}-release.apk`;
   const apkOut = path.join(ROOT, apkName);
+  const latestPath = path.join(ROOT, "latest.json");
+  const existingLatest = readExistingLatest(latestPath);
 
   const endpoint = getConfig("S3_ENDPOINT", { required: true });
   const bucket = getConfig("S3_BUCKET", { required: true });
@@ -317,7 +361,11 @@ async function main() {
   const forcePathStyle = String(getConfig("S3_FORCE_PATH_STYLE", { defaultValue: "true" })).toLowerCase() !== "false";
   const prefix = normalizePrefix(getConfig("S3_PREFIX", { defaultValue: "app" }));
   const configuredReleaseNotes = getConfig("RELEASE_NOTES", { defaultValue: "" });
-  const releaseNotes = configuredReleaseNotes || buildAutoReleaseNotes(version);
+  const releaseNotes = resolveReleaseNotes({
+    version,
+    configuredReleaseNotes,
+    existingLatest
+  });
 
   run("npm run cap:sync");
   const gradleCmd = process.platform === "win32" ? "gradlew.bat assembleRelease" : "./gradlew assembleRelease";
@@ -335,8 +383,6 @@ async function main() {
   const latestKey = `${prefix}latest.json`;
   const downloadUrl = joinUrl(publicBaseUrl, apkKey);
 
-  const latestPath = path.join(ROOT, "latest.json");
-  const existingLatest = readExistingLatest(latestPath);
   const currentRelease = {
     version,
     downloadUrl,
