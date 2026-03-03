@@ -181,8 +181,9 @@ function resolveReleaseNotes({ version, configuredReleaseNotes, existingLatest }
     console.log("[info] 发布日志来源: latest.json 当前版本 notes");
     return notesInLatest;
   }
-  console.log("[info] 发布日志来源: git log 自动生成");
-  return buildAutoReleaseNotes(version);
+  throw new Error(
+    `缺少 ${version} 发布日志。请设置 RELEASE_NOTES，或先在 latest.json 中写入 version=${version} 的 notes 后再发布。`
+  );
 }
 
 async function uploadToS3({ endpoint, region, bucket, accessKeyId, secretAccessKey, forcePathStyle, key, filePath, contentType }) {

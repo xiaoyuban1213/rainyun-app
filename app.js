@@ -13,7 +13,7 @@ import "@arco-design/web-vue/es/typography/style/css.js";
 
 const BRAND_LOGO = new URL("./assets/icons/app-icon-20260228.jpg", import.meta.url).href;
 const AVATAR = new URL("./assets/images/default-avatar.svg", import.meta.url).href;
-const APP_VERSION = "1.1.4";
+const APP_VERSION = "1.1.5";
 const SEASON_BG_MAP = {
   spring: "https://forum.rainyun.com/uploads/default/original/2X/c/c945ac6e94feae902f54476fd53c65cc74d027fb.webp",
   summer: "https://forum.rainyun.com/uploads/default/original/2X/b/b89be1c923371d70912118bc3038cee6f1f77f0f.webp",
@@ -552,7 +552,9 @@ function normalizeResellDetailRows(rows) {
           return {
             ts: Math.floor(readyTs),
             day: readyDay,
-            income: readyIncome
+            income: readyIncome,
+            stock: Number.isFinite(Number(row.stock)) ? Number(row.stock) : 0,
+            userId: String(row.userId || "")
           };
         }
       }
@@ -565,14 +567,58 @@ function normalizeResellDetailRows(rows) {
       const points = toNumberOrNull(pickFirstFieldDeep(row, ["points", "Points", "profit_points", "ProfitPoints"]));
       const income = points !== null ? points / 2000 : null;
       if (income === null || !Number.isFinite(income)) return null;
+      const stock = toNumberOrNull(pickFirstFieldDeep(row, [
+        "stock", "Stock", "stock_money", "StockMoney",
+        "resell_money", "ResellMoney", "stock_amount"
+      ])) ?? 0;
+      const userIdRaw = pickFirstFieldDeep(row, ["uid", "Uid", "user_id", "UserID", "userId", "userid", "users.id"]);
       return {
         ts: Math.floor(tsMs),
         day: toDayKey(tsMs),
-        income: Number(income)
+        income: Number(income),
+        stock: Number(stock),
+        userId: userIdRaw === null || userIdRaw === undefined ? "" : String(userIdRaw)
       };
     })
     .filter(Boolean)
     .sort((a, b) => a.ts - b.ts);
+}
+
+function calcPromoTrendFromDetailRows(rows, now = new Date()) {
+  const list = Array.isArray(rows) ? rows : [];
+  const y = now.getFullYear();
+  const m = now.getMonth();
+  const currentPrefix = `${y}-${String(m + 1).padStart(2, "0")}-`;
+  const prevDate = new Date(y, m - 1, 1);
+  const prevPrefix = `${prevDate.getFullYear()}-${String(prevDate.getMonth() + 1).padStart(2, "0")}-`;
+  const todayKey = toDayKey(now);
+  let monthIncome = 0;
+  let prevMonthIncome = 0;
+  let todayStock = 0;
+  let monthStock = 0;
+  const monthUserIds = new Set();
+  for (const row of list) {
+    const day = String(row?.day || "");
+    const income = Number(row?.income || 0);
+    const stock = Number(row?.stock || 0);
+    const userId = String(row?.userId || "");
+    if (!Number.isFinite(income)) continue;
+    if (day.startsWith(currentPrefix)) {
+      monthIncome += income;
+      if (Number.isFinite(stock)) monthStock += stock;
+      if (day === todayKey && Number.isFinite(stock)) todayStock += stock;
+      if (userId) monthUserIds.add(userId);
+    } else if (day.startsWith(prevPrefix)) {
+      prevMonthIncome += income;
+    }
+  }
+  return {
+    monthIncome: Number(monthIncome.toFixed(4)),
+    prevMonthIncome: Number(prevMonthIncome.toFixed(4)),
+    todayStock: Number(todayStock.toFixed(2)),
+    monthStock: Number(monthStock.toFixed(2)),
+    monthNewUser: monthUserIds.size
+  };
 }
 
 async function fetchPromoResellDetailRows(options = {}) {
@@ -1970,7 +2016,7 @@ const MobileShell = {
           <h1>雨云 App</h1>
           <p>{{ title }}</p>
         </div>
-        <button class="m-header-account" @click="goAccount">
+        <button v-if="showAccountBtn" class="m-header-account" @click="goAccount">
           <img :src="avatar" alt="account" class="m-header-account-avatar" />
           <span>{{ isAuthed ? '已登录' : '去登录' }}</span>
         </button>
@@ -1990,6 +2036,10 @@ const MobileShell = {
     const router = useRouter();
     const route = useRoute();
     const isAuthed = computed(() => isAuthenticated());
+    const showAccountBtn = computed(() => {
+      const p = String(route.path || "");
+      return p !== "/login" && p !== "/me";
+    });
     const touchState = { active: false, startX: 0, startY: 0, deltaX: 0, deltaY: 0 };
     const isTabRootPath = (path) => {
       const p = String(path || "/");
@@ -2060,7 +2110,7 @@ const MobileShell = {
         AVATAR
       );
     });
-    return { go, goAccount, tabClass, mainClass, logo: BRAND_LOGO, onTouchStart, onTouchMove, onTouchEnd, isAuthed, avatar };
+    return { go, goAccount, tabClass, mainClass, logo: BRAND_LOGO, onTouchStart, onTouchMove, onTouchEnd, isAuthed, avatar, showAccountBtn };
   }
 };
 
@@ -2087,23 +2137,39 @@ const HomePage = {
       </section>
 
       <section class="panel stat-grid">
-        <div class="stat-cell"><b>{{ balance }}</b><span>余额</span></div>
-        <div class="stat-cell"><b>{{ points }}</b><span>积分</span></div>
-        <div class="stat-cell"><b>{{ monthCost }}</b><span>本月消费</span></div>
-        <div class="stat-cell"><b>{{ productTotal }}</b><span>产品总数</span></div>
+        <div class="stat-cell stat-balance">
+          <div class="stat-cell-head"><i class="fa-solid fa-wallet"></i><span>余额</span></div>
+          <b>{{ balance }}</b>
+          <small>账户可用余额</small>
+        </div>
+        <div class="stat-cell stat-points">
+          <div class="stat-cell-head"><i class="fa-solid fa-coins"></i><span>积分</span></div>
+          <b>{{ points }}</b>
+          <small>当前积分资产</small>
+        </div>
+        <div class="stat-cell stat-cost">
+          <div class="stat-cell-head"><i class="fa-solid fa-receipt"></i><span>本月消费</span></div>
+          <b>{{ monthCost }}</b>
+          <small>当月消费合计</small>
+        </div>
+        <div class="stat-cell stat-products">
+          <div class="stat-cell-head"><i class="fa-solid fa-cubes"></i><span>产品总数</span></div>
+          <b>{{ productTotal }}</b>
+          <small>当前已开通产品</small>
+        </div>
       </section>
 
       <section class="panel">
         <div class="panel-title">
           <a-typography-title :heading="6" class="typo-title">代办事件</a-typography-title>
           <div class="title-actions">
-            <a-typography-text class="panel-subtext" type="secondary">同步 {{ lastSyncAt || '--:--:--' }}</a-typography-text>
-            <a-button class="link-btn" size="mini" type="outline" :loading="syncing" @click="refresh">{{ syncing ? '同步中...' : '刷新' }}</a-button>
+            <a-typography-text class="panel-subtext sync-time-text" type="secondary">同步 {{ lastSyncAt || '--:--:--' }}</a-typography-text>
+            <a-button class="line-btn sm" size="small" type="outline" :loading="syncing" @click="refresh">{{ syncing ? '同步中...' : '刷新' }}</a-button>
           </div>
         </div>
         <div class="todo-row">
           <button class="todo-card" @click="goTodo('ticket')"><i class="fa-regular fa-life-ring"></i><b>{{ tickets }}</b><span>工单</span></button>
-          <button class="todo-card" @click="goTodo('renew')"><i class="fa-solid fa-clock-rotate-left"></i><b>{{ renew }}</b><span>待续费</span></button>
+          <button :class="['todo-card', { 'is-urgent': renew > 0 }]" @click="goTodo('renew')"><i class="fa-solid fa-clock-rotate-left"></i><b>{{ renew }}</b><span>待续费</span></button>
           <button class="todo-card" @click="goTodo('coupon')"><i class="fa-solid fa-ticket"></i><b>{{ coupons }}</b><span>优惠券</span></button>
         </div>
       </section>
@@ -2111,7 +2177,7 @@ const HomePage = {
       <section class="panel">
         <div class="panel-title">
           <a-typography-title :heading="6" class="typo-title">产品入口</a-typography-title>
-          <a-typography-text class="panel-subtext" type="secondary">数据来源 {{ source }}</a-typography-text>
+          <a-typography-text class="panel-subtext" type="secondary">产品总览</a-typography-text>
         </div>
         <div class="entry-grid">
           <button class="entry" v-for="item in productEntries" :key="item.kind" @click="openEntry(item)">
@@ -2232,11 +2298,8 @@ const TodoPage = {
       <section class="panel">
         <div class="panel-title">
           <a-typography-title :heading="6" class="typo-title">{{ title }}</a-typography-title>
-          <a-button class="link-btn" size="mini" type="outline" @click="loadData">刷新</a-button>
+          <a-button class="line-btn sm" size="small" type="outline" @click="loadData">刷新</a-button>
         </div>
-        <a-typography-text class="muted" type="secondary" v-if="type === 'ticket'">接口：<code>/workorder/?options=...</code></a-typography-text>
-        <a-typography-text class="muted" type="secondary" v-if="type === 'renew'">接口：<code>/product/*/{id}/</code> + <code>/product/rcs/price?scene=renew...</code></a-typography-text>
-        <a-typography-text class="muted" type="secondary" v-if="type === 'coupon'">接口：<code>/user/coupons/</code></a-typography-text>
       </section>
 
       <section class="panel" v-if="loading">
@@ -2441,10 +2504,18 @@ const ProductListPage = {
           <a-typography-title :heading="6" class="typo-title">{{ kindLabel }}</a-typography-title>
           <a-typography-text class="panel-subtext" type="secondary">共 {{ ids.length }} 项</a-typography-text>
         </div>
-        <div class="list-toolbar">
+        <div class="list-toolbar" :class="{ 'has-ip-toggle': showRichCard }">
           <a-input v-model="keyword" allow-clear placeholder="搜索ID" inputmode="numeric" />
           <a-button class="line-btn sm" size="small" type="outline" @click="toggleSort">{{ asc ? '升序' : '降序' }}</a-button>
           <a-button class="line-btn sm" size="small" type="outline" @click="refresh">刷新</a-button>
+          <a-button
+            v-if="showRichCard"
+            class="line-btn sm"
+            :class="{ 'is-toggled': showIp }"
+            size="small"
+            type="outline"
+            @click="toggleIpVisible"
+          >{{ showIp ? '隐藏IP' : '显示IP' }}</a-button>
         </div>
         <div class="list-tip" v-if="keyword">匹配 {{ viewIds.length }} 项</div>
         <div v-if="!viewIds.length" class="empty">暂无匹配数据</div>
@@ -2459,7 +2530,7 @@ const ProductListPage = {
               </div>
               <div class="detail-card-sub">{{ getCardMeta(id).nodeText }}</div>
               <div class="detail-card-kv">
-                <span>IP：{{ getCardMeta(id).ipText }}</span>
+                <span>IP：{{ showIp ? getCardMeta(id).ipText : '已隐藏' }}</span>
                 <span>到期：{{ getCardMeta(id).expireText }}</span>
               </div>
               <div class="detail-card-bars" v-if="getCardMeta(id).showMetrics">
@@ -2500,6 +2571,7 @@ const ProductListPage = {
     const asc = ref(true);
     const kindLabel = computed(() => getKindLabel(kind.value));
     const detailMetaMap = ref({});
+    const showIp = ref(false);
     const showRichCard = computed(() => ["rcs", "rgpu", "rgs"].includes(String(kind.value || "")));
     const viewIds = computed(() => {
       const list = [...ids.value];
@@ -2552,6 +2624,9 @@ const ProductListPage = {
       const row = Array.isArray(rows) ? rows.find((x) => String(x?.key || "") === key) : null;
       return row ? String(row.value || "") : "";
     };
+    const pickRow = (rows, key) => {
+      return Array.isArray(rows) ? (rows.find((x) => String(x?.key || "") === key) || null) : null;
+    };
     const parseExpireBrief = (raw) => {
       const s = String(raw || "").trim();
       if (!s || s === "-") return "-";
@@ -2597,11 +2672,13 @@ const ProductListPage = {
       const info = view.serverInfo || {};
       const baseRows = Array.isArray(view.baseInfo) ? view.baseInfo : [];
       const monitorRows = Array.isArray(view.monitorRows) ? view.monitorRows : [];
+      const cpuRow = pickRow(monitorRows, "CPU(%)");
+      const memRow = pickRow(monitorRows, "内存使用") || pickRow(monitorRows, "内存占用");
       const status = getStatusMeta(info.status);
-      const cpuText = pickRowValue(monitorRows, "CPU(%)") || "-";
-      const memText = pickRowValue(monitorRows, "内存使用") || "-";
+      const cpuText = cpuRow ? String(cpuRow.value || "") : "-";
+      const memText = memRow ? String(memRow.value || "") : "-";
       const cpuPercent = parsePercentText(cpuText) ?? 0;
-      const memPercent = parseMemPercent(memText) ?? 0;
+      const memPercent = toNumberOrNull(memRow?.percent) ?? parseMemPercent(memText) ?? 0;
       return {
         statusText: status.statusText,
         statusClass: status.statusClass,
@@ -2661,6 +2738,9 @@ const ProductListPage = {
     };
     const openDetail = (id) => router.push(`/product/${kind.value}/${id}`);
     const toggleSort = () => { asc.value = !asc.value; };
+    const toggleIpVisible = () => {
+      showIp.value = !showIp.value;
+    };
     const refresh = async () => {
       await refreshSummary(true);
       await loadCardMeta(true);
@@ -2706,7 +2786,22 @@ const ProductListPage = {
       await refreshSummary(false);
       await loadCardMeta(false);
     });
-    return { ids, kindLabel, viewIds, keyword, asc, showRichCard, openDetail, toggleSort, refresh, copyAllIds, openMainSite, getCardMeta };
+    return {
+      ids,
+      kindLabel,
+      viewIds,
+      keyword,
+      asc,
+      showRichCard,
+      showIp,
+      toggleIpVisible,
+      openDetail,
+      toggleSort,
+      refresh,
+      copyAllIds,
+      openMainSite,
+      getCardMeta
+    };
   }
 };
 
@@ -2727,7 +2822,6 @@ const ProductDetailPage = {
           <section class="panel detail-main-panel">
             <div class="panel-title">
               <a-typography-title :heading="6" class="typo-title">{{ (kind === 'rcs' || kind === 'rgpu' || kind === 'rgs') ? '服务器信息' : (kind === 'rca' ? '应用信息' : '基础状态') }}</a-typography-title>
-              <a-typography-text class="panel-subtext" type="secondary">{{ detailPath || '--' }}</a-typography-text>
             </div>
             <div v-if="kind === 'rcs' || kind === 'rgpu' || kind === 'rgs' || kind === 'rca'" class="server-info-list">
               <div class="server-row"><span>{{ kind === 'rca' ? '项目 ID' : '服务器 ID' }}</span><b>{{ serverInfo.id }}</b></div>
@@ -2783,9 +2877,6 @@ const ProductDetailPage = {
               <div v-if="vncLoading" class="vnc-loading-tip">正在获取 VNC 地址...</div>
               <div v-if="opLoading" class="vnc-loading-tip">正在执行操作...</div>
               <div v-if="opErrorText" class="vnc-loading-tip is-error">{{ opErrorText }}</div>
-              <div v-if="opApiPath" class="detail-op-path">
-                <a-typography-text class="panel-subtext" type="secondary">控制接口：{{ opApiPath }}</a-typography-text>
-              </div>
             </div>
             <div v-else class="detail-metrics">
               <div class="metric-item" v-for="row in baseInfo" :key="'base-' + row.key">
@@ -2800,7 +2891,6 @@ const ProductDetailPage = {
           <section class="panel detail-config-panel">
             <div class="panel-title">
               <a-typography-title :heading="6" class="typo-title">配置信息</a-typography-title>
-              <a-typography-text class="panel-subtext" type="secondary">{{ detailPath || '--' }}</a-typography-text>
             </div>
             <div class="kv" v-for="row in configRows" :key="'cfg-' + row.key + row.value">
               <span>{{ row.key }}</span><b>{{ row.value }}</b>
@@ -2810,7 +2900,6 @@ const ProductDetailPage = {
           <section class="panel detail-monitor-panel" v-if="monitorPath">
             <div class="panel-title">
               <a-typography-title :heading="6" class="typo-title">监控信息</a-typography-title>
-              <a-typography-text class="panel-subtext" type="secondary">{{ monitorPath }}</a-typography-text>
             </div>
             <div v-if="monitorChartRows.length" class="monitor-chart-list">
               <div class="monitor-chart-item" v-for="row in monitorChartRows" :key="'m-' + row.key">
@@ -3566,7 +3655,6 @@ const PromoPage = {
             <button class="about-close" @click="closeDailyReport"><i class="fa-solid fa-xmark"></i></button>
           </div>
           <div class="promo-report-meta">
-            <span>数据来源：<code>{{ dailyReport.source }}</code></span>
             <span>分析时间：{{ dailyReport.generatedAt }}</span>
           </div>
           <div class="promo-report-kv">
@@ -3603,6 +3691,15 @@ const PromoPage = {
   setup() {
     const profile = computed(() => store.userProfile || {});
     const showDailyReport = ref(false);
+    const promoTrendFromDetail = ref({
+      monthIncome: null,
+      prevMonthIncome: null,
+      todayStock: null,
+      monthStock: null,
+      monthNewUser: null,
+      source: "",
+      updatedAt: 0
+    });
     const dailyReport = ref({
       source: "/user/",
       todayIncome: "-",
@@ -3635,8 +3732,10 @@ const PromoPage = {
       const secondaryCurrent = toNumberOrNull(pickFirstFieldDeep(p, ["SecondStockQuarter", "second_stock_quarter"])) ?? 0;
       const primaryTarget = toNumberOrNull(vip.StockRequire) ?? 0;
       const secondaryTarget = toNumberOrNull(vip.SecondStockRequire) ?? 0;
-      const prevMonthIncome = incomeMetrics.prevMonthIncome;
-      const currMonthIncomeRaw = incomeMetrics.monthIncome ?? 0;
+      const detailMonthIncome = toNumberOrNull(promoTrendFromDetail.value.monthIncome);
+      const detailPrevMonthIncome = toNumberOrNull(promoTrendFromDetail.value.prevMonthIncome);
+      const prevMonthIncome = detailPrevMonthIncome ?? incomeMetrics.prevMonthIncome;
+      const currMonthIncomeRaw = detailMonthIncome ?? incomeMetrics.monthIncome ?? 0;
       const todayIncomeRaw = incomeMetrics.todayIncome ?? 0;
       const totalIncomeRaw = incomeMetrics.totalIncome ?? 0;
       const totalStockRaw = toNumberOrNull(pickFirstFieldDeep(p, ["StockAll", "stock_all", "promotion_total_stock"])) ?? 0;
@@ -3675,6 +3774,7 @@ const PromoPage = {
         prevMonthIncome: formatMoney(prevMonthIncome).replace("¥ ", ""),
         prevMonthIncomeRaw: prevMonthIncome ?? 0,
         todayIncomeRaw,
+        detailIncomeSource: String(promoTrendFromDetail.value.source || ""),
         momRate: momRate === null ? "-" : `${momRate >= 0 ? "+" : ""}${formatFixed2(momRate)}%`,
         todayStock: formatCount(pickFirstFieldDeep(p, ["StockDaily", "today_stock", "today_purchase", "promotion_today_stock"])),
         monthStock: formatFixed2(pickFirstFieldDeep(p, ["StockMonthly", "month_stock", "month_purchase", "promotion_month_stock"])),
@@ -3919,12 +4019,43 @@ const PromoPage = {
       };
     }
 
+    async function syncPromoIncomeFromDetail(options = {}) {
+      if (!isAuthenticated()) return;
+      const force = Boolean(options.force);
+      try {
+        const rows = await fetchPromoResellDetailRows({ force, daysBack: 95 });
+        if (!rows.length) return;
+        const trend = calcPromoTrendFromDetailRows(rows, new Date());
+        promoTrendFromDetail.value = {
+          monthIncome: Number(trend.monthIncome || 0),
+          prevMonthIncome: Number(trend.prevMonthIncome || 0),
+          todayStock: Number(trend.todayStock || 0),
+          monthStock: Number(trend.monthStock || 0),
+          monthNewUser: Number(trend.monthNewUser || 0),
+          source: "/user/vip/resell_detail",
+          updatedAt: Date.now()
+        };
+      } catch (e) {
+        reportLog("WARN", "promo_stage_income_from_detail_error", { error: String(e) });
+      }
+    }
+
     async function buildDailyIncomeReport(options = {}) {
       const force = Boolean(options.force);
       const now = new Date();
       try {
         const detailRows = await fetchPromoResellDetailRows({ force, daysBack: 60 });
         if (detailRows.length) {
+          const trend = calcPromoTrendFromDetailRows(detailRows, now);
+          promoTrendFromDetail.value = {
+            monthIncome: Number(trend.monthIncome || 0),
+            prevMonthIncome: Number(trend.prevMonthIncome || 0),
+            todayStock: Number(trend.todayStock || 0),
+            monthStock: Number(trend.monthStock || 0),
+            monthNewUser: Number(trend.monthNewUser || 0),
+            source: "/user/vip/resell_detail",
+            updatedAt: Date.now()
+          };
           const map = new Map();
           for (const row of detailRows) {
             map.set(row.day, Number((Number(map.get(row.day) || 0) + Number(row.income || 0)).toFixed(4)));
@@ -3935,7 +4066,7 @@ const PromoPage = {
             if (String(day).startsWith(monthPrefix)) monthIncome += Number(value || 0);
           }
           const todayIncome = Number(map.get(toDayKey(now)) || 0);
-          const prevMonthIncome = Math.max(0, Number(promo.value.prevMonthIncomeRaw || 0));
+          const prevMonthIncome = Math.max(0, Number(trend.prevMonthIncome || 0));
           const series = Array.from(map.entries())
             .map(([day, total]) => ({ day, totalIncome: Number(total) }))
             .sort((a, b) => String(a.day).localeCompare(String(b.day)));
@@ -3981,7 +4112,10 @@ const PromoPage = {
     function closeDailyReport() {
       showDailyReport.value = false;
     }
-    onMounted(() => refreshSummary(false));
+    onMounted(async () => {
+      await refreshSummary(false);
+      syncPromoIncomeFromDetail({ force: false });
+    });
     return { avatar, promo, copyLink, openLink, shareLink, showDailyReport, dailyReport, openDailyReport, refreshDailyReport, closeDailyReport };
   }
 };
@@ -3991,21 +4125,57 @@ const LoginPage = {
   template: `
     <MobileShell :title="isEditMode ? '编辑 API Key' : '登录'">
       <section class="panel login-hero">
-        <a-typography-title :heading="5" class="typo-title">{{ isEditMode ? '编辑 API Key' : 'API Key 登录' }}</a-typography-title>
-        <a-typography-text class="panel-subtext" type="secondary">
-          {{ isEditMode ? '修改后将立即重新同步账号数据。' : '仅需输入 API Key 即可完成登录。' }}
-        </a-typography-text>
+        <div class="login-hero-head">
+          <div class="login-hero-icon"><i class="fa-solid fa-shield-halved"></i></div>
+          <div class="login-hero-main">
+            <a-typography-title :heading="5" class="typo-title">{{ isEditMode ? '编辑 API Key' : '使用 API Key 登录 RainYun App' }}</a-typography-title>
+            <a-typography-text class="panel-subtext" type="secondary">
+              {{ isEditMode ? '修改后将立即重新同步账号数据。' : '输入 API Key，快速连接你的 RainYun 账号。' }}
+            </a-typography-text>
+          </div>
+        </div>
+        <div class="login-badges" v-if="!isEditMode">
+          <span><i class="fa-solid fa-bolt"></i> 快速接入</span>
+          <span><i class="fa-solid fa-lock"></i> 本地存储</span>
+          <span><i class="fa-solid fa-arrows-rotate"></i> 一键同步</span>
+          <span><i class="fa-solid fa-key"></i> 仅 API Key</span>
+        </div>
       </section>
 
       <section class="panel login-panel">
+        <div class="login-form-head">
+          <a-typography-title :heading="6" class="typo-title">{{ isEditMode ? '更新凭证' : '开始使用' }}</a-typography-title>
+          <a-typography-text class="panel-subtext" type="secondary">请输入 RainYun 控制台生成的 API Key</a-typography-text>
+        </div>
         <div class="form-grid">
           <label>API Key
-            <a-input v-model="form.apiKey" placeholder="请输入 API Key" />
+            <a-input v-model="form.apiKey" placeholder="粘贴你的 API Key" />
           </label>
         </div>
+        <a-typography-text class="muted login-tip" type="secondary">不会上传到第三方服务器，仅用于本地请求 RainYun API。</a-typography-text>
         <div class="btn-row">
           <a-button class="primary-btn" type="primary" :loading="loading" @click="submitLogin">{{ isEditMode ? '更新并同步' : '保存并同步' }}</a-button>
         </div>
+      </section>
+
+      <section class="panel login-help" v-if="!isEditMode">
+        <div class="login-help-head">
+          <a-typography-title :heading="6" class="typo-title">获取与使用</a-typography-title>
+          <a-button class="line-btn sm login-guide-btn" size="small" type="outline" @click="openApiKeyGuide">前往API密钥页面</a-button>
+        </div>
+        <div class="login-help-note">在 RainYun 控制台创建 API Key 后，复制并粘贴到上方输入框即可。</div>
+        <details class="login-faq-item">
+          <summary>API Key 在哪里创建？</summary>
+          <p>进入 RainYun 控制台账号相关页面，进入 API密钥 页面，并复制。</p>
+        </details>
+        <details class="login-faq-item">
+          <summary>提示认证失败怎么办？</summary>
+          <p>先确认 Key 是否完整复制、是否已过期，再重新生成后重试。</p>
+        </details>
+        <details class="login-faq-item">
+          <summary>会上传到其他服务器吗？</summary>
+          <p>不会。应用仅在本地保存并直接请求 RainYun API。</p>
+        </details>
       </section>
     </MobileShell>
   `,
@@ -4054,7 +4224,11 @@ const LoginPage = {
       if (isAuthenticated() && !isEditMode.value) router.replace("/home");
     });
 
-    return { form, loading, submitLogin, isEditMode };
+    const openApiKeyGuide = () => {
+      window.open("https://app.rainyun.com/account/settings/api-key", "_blank");
+    };
+
+    return { form, loading, submitLogin, isEditMode, openApiKeyGuide };
   }
 };
 
@@ -4089,11 +4263,15 @@ const MePage = {
         <div class="panel-title"><a-typography-title :heading="6" class="typo-title">账号中心</a-typography-title></div>
         <div class="kv"><span>认证方式</span><b>{{ authInfo.modeText }}</b></div>
         <div class="kv"><span>认证标识</span><b>{{ authInfo.masked }}</b></div>
-        <div class="btn-row">
-          <a-button class="primary-btn" type="primary" @click="goLogin">编辑 API Key</a-button>
-          <a-button class="line-btn" type="outline" @click="logout">退出登录</a-button>
-          <a-button class="line-btn about-btn" type="outline" @click="openAbout">关于应用</a-button>
-          <a-button class="line-btn update-btn" type="outline" @click="checkUpdate">检查更新</a-button>
+        <div class="account-actions">
+          <div class="account-actions-top">
+            <a-button class="primary-btn" type="primary" @click="goLogin">编辑 API Key</a-button>
+          </div>
+          <div class="account-actions-bottom">
+            <a-button class="line-btn" type="outline" @click="logout">退出登录</a-button>
+            <a-button class="line-btn about-btn" type="outline" @click="openAbout">关于应用</a-button>
+            <a-button class="line-btn update-btn" type="outline" @click="checkUpdate">检查更新</a-button>
+          </div>
         </div>
       </section>
 
