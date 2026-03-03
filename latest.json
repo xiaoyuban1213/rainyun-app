@@ -1,11 +1,18 @@
 {
-  "version": "1.1.2",
-  "downloadUrl": "http://ros.yuban.cloud/app/RainYun-App-v1.1.2-release.apk",
-  "notes": "1. 修复 Android 12 部分机型底部 Tab 栏随页面滚动的问题。\n2. 增加视口高度兼容兜底，提升不同 WebView 版本下的底栏稳定性。\n3. 持续优化详情页数据刷新体验与界面一致性。",
-  "sha256": "68AE09D5A564D57F6C911C942711DDE551AB88297ED27A4B8DACE4C27465A70D",
-  "buildTime": "2026-02-28T16:49:56+08:00",
+  "version": "1.1.3",
+  "downloadUrl": "http://ros.yuban.cloud/app/RainYun-App-v1.1.3-release.apk",
+  "notes": "1. 优化云服务器/显卡云列表卡片展示：新增状态、节点、IP、到期时间与 CPU/内存简版进度条。\n2. 修复显卡云列表数据获取失败问题（接口路径映射修正为 rcs 详情接口）。\n3. 完善服务器详情远程连接信息展示（公网 IP、远程用户、远程密码复制/查看）。\n4. 优化启动动画与加载链路：缩短最短展示时长，增加开屏超时关闭，待续费统计改为后台计算。\n5. 支持论坛四季背景图按月份自动轮换（spring/summer/autumn/winter）。",
+  "sha256": "35E9483F744DFF7DA3C50A3DEB91655EEBC9572F3567B789F2DBCDC86C6E7CB6",
+  "buildTime": "2026-03-01T15:36:33+08:00",
   "force": false,
   "history": [
+    {
+      "version": "1.1.3",
+      "notes": "1. 优化云服务器/显卡云列表卡片展示：新增状态、节点、IP、到期时间与 CPU/内存简版进度条。\n2. 修复显卡云列表数据获取失败问题（接口路径映射修正为 rcs 详情接口）。\n3. 完善服务器详情远程连接信息展示（公网 IP、远程用户、远程密码复制/查看）。\n4. 优化启动动画与加载链路：缩短最短展示时长，增加开屏超时关闭，待续费统计改为后台计算。\n5. 支持论坛四季背景图按月份自动轮换（spring/summer/autumn/winter）。",
+      "buildTime": "2026-03-01T15:36:33+08:00",
+      "downloadUrl": "http://ros.yuban.cloud/app/RainYun-App-v1.1.3-release.apk",
+      "sha256": "35E9483F744DFF7DA3C50A3DEB91655EEBC9572F3567B789F2DBCDC86C6E7CB6"
+    },
     {
       "version": "1.1.2",
       "notes": "1. 修复 Android 12 部分机型底部 Tab 栏随页面滚动的问题。\n2. 增加视口高度兼容兜底，提升不同 WebView 版本下的底栏稳定性。\n3. 持续优化详情页数据刷新体验与界面一致性。",

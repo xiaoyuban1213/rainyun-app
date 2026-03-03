@@ -11,9 +11,15 @@ import "@arco-design/web-vue/es/input/style/css.js";
 import "@arco-design/web-vue/es/tag/style/css.js";
 import "@arco-design/web-vue/es/typography/style/css.js";
 
-const BRAND_LOGO = "https://cdn.apifox.com/app/project-icon/custom/20231116/e416b172-004f-452f-8090-8e85991f422c.png";
+const BRAND_LOGO = new URL("./assets/icons/app-icon-20260228.jpg", import.meta.url).href;
 const AVATAR = new URL("./assets/images/default-avatar.svg", import.meta.url).href;
-const APP_VERSION = "1.1.2";
+const APP_VERSION = "1.1.3";
+const SEASON_BG_MAP = {
+  spring: "https://forum.rainyun.com/uploads/default/original/2X/c/c945ac6e94feae902f54476fd53c65cc74d027fb.webp",
+  summer: "https://forum.rainyun.com/uploads/default/original/2X/b/b89be1c923371d70912118bc3038cee6f1f77f0f.webp",
+  autumn: "https://forum.rainyun.com/uploads/default/original/2X/4/4b3c5d4d362135ec0cc7ab7caf93968b975d6520.webp",
+  winter: "https://forum.rainyun.com/uploads/default/original/2X/a/a6d0adf789d1988ad4c94de0c33d592361e3a861.webp"
+};
 const UPDATE_BASE_URL = "http://ros.yuban.cloud/app";
 const UPDATE_FEED_URL = `${UPDATE_BASE_URL}/latest.json`;
 const DETAIL_AUTO_REFRESH_MS = 6000;
@@ -75,6 +81,23 @@ function initNavOriginTracker() {
   window.addEventListener("resize", setCenter, { passive: true });
 }
 
+function seasonByMonth(month1to12) {
+  const m = Number(month1to12);
+  if (m >= 3 && m <= 5) return "spring";
+  if (m >= 6 && m <= 8) return "summer";
+  if (m >= 9 && m <= 11) return "autumn";
+  return "winter";
+}
+
+function applySeasonBackground() {
+  if (typeof document === "undefined") return;
+  const now = new Date();
+  const season = seasonByMonth(now.getMonth() + 1);
+  const bg = SEASON_BG_MAP[season] || "";
+  document.documentElement.style.setProperty("--season-bg-url", bg ? `url("${bg}")` : "none");
+  document.documentElement.setAttribute("data-season", season);
+}
+
 const store = reactive({
   auth: loadAuth(),
   loading: false,
@@ -95,6 +118,7 @@ const store = reactive({
 let summaryInflightPromise = null;
 let renewPriceInflightPromise = null;
 let couponInflightPromise = null;
+let renewDueInflightPromise = null;
 const apiGetCache = new Map();
 const apiGetInflight = new Map();
 const API_GET_DEFAULT_TTL = 8000;
@@ -106,10 +130,11 @@ const PROMO_DAILY_CACHE_KEY = "rainyun-promo-income-daily-cache";
 const API_REQUEST_CACHE_LIMIT = 240;
 const PROMO_DAILY_CACHE_LIMIT = 180;
 const BOOT_METRICS_KEY = "rainyun-boot-metrics-v1";
-const BOOT_EXPECTED_FALLBACK_MS = 2600;
+const BOOT_EXPECTED_FALLBACK_MS = 1900;
 const BOOT_EXPECTED_MIN_MS = 1200;
 const BOOT_EXPECTED_MAX_MS = 6500;
-const BOOT_MIN_VISIBLE_MS = 700;
+const BOOT_MIN_VISIBLE_MS = 420;
+const BOOT_FORCE_CLOSE_MS = 2200;
 const BOOT_EMA_ALPHA = 0.35;
 const AUTH_LOGIN_PATHS = ["/user/login", "/auth/login", "/login", "/account/login"];
 const TENCENT_CAPTCHA_APP_ID = "2039519451";
@@ -120,6 +145,88 @@ function toast(msg) {
   el.textContent = msg;
   el.classList.add("show");
   setTimeout(() => el.classList.remove("show"), 1800);
+}
+
+const appDialogState = reactive({
+  visible: false,
+  mode: "confirm",
+  title: "提示",
+  message: "",
+  confirmText: "确定",
+  cancelText: "取消",
+  showCancel: true,
+  inputValue: "",
+  inputPlaceholder: "",
+  inputLabel: "",
+  openedAt: 0,
+  _resolver: null
+});
+const appDialogQueue = [];
+
+function pumpAppDialogQueue() {
+  if (appDialogState.visible) return;
+  const next = appDialogQueue.shift();
+  if (!next) return;
+  const opts = next.options || {};
+  appDialogState.mode = opts.mode || "confirm";
+  appDialogState.title = String(opts.title || "提示");
+  appDialogState.message = String(opts.message || "");
+  appDialogState.confirmText = String(opts.confirmText || "确定");
+  appDialogState.cancelText = String(opts.cancelText || "取消");
+  appDialogState.showCancel = typeof opts.showCancel === "boolean" ? opts.showCancel : appDialogState.mode !== "alert";
+  appDialogState.inputValue = String(opts.inputValue || "");
+  appDialogState.inputPlaceholder = String(opts.inputPlaceholder || "");
+  appDialogState.inputLabel = String(opts.inputLabel || "");
+  appDialogState.openedAt = Date.now();
+  appDialogState._resolver = next.resolve;
+  appDialogState.visible = true;
+}
+
+function openAppDialog(options = {}) {
+  return new Promise((resolve) => {
+    appDialogQueue.push({ options, resolve });
+    pumpAppDialogQueue();
+  });
+}
+
+function closeAppDialog(result = { ok: false, value: "" }) {
+  const resolver = appDialogState._resolver;
+  appDialogState.visible = false;
+  appDialogState._resolver = null;
+  setTimeout(() => {
+    if (typeof resolver === "function") resolver(result);
+    pumpAppDialogQueue();
+  }, 0);
+}
+
+async function appConfirm(message, options = {}) {
+  const result = await openAppDialog({
+    mode: "confirm",
+    title: options.title || "确认操作",
+    message: String(message || ""),
+    confirmText: options.confirmText || "确定",
+    cancelText: options.cancelText || "取消",
+    showCancel: true
+  });
+  return Boolean(result && result.ok);
+}
+
+async function appPrompt(title, value = "", options = {}) {
+  const result = await openAppDialog({
+    mode: "prompt",
+    title: title || "输入信息",
+    message: options.message || "",
+    confirmText: options.confirmText || "确定",
+    cancelText: options.cancelText || "取消",
+    showCancel: true,
+    inputValue: String(value || ""),
+    inputPlaceholder: String(options.inputPlaceholder || ""),
+    inputLabel: String(options.inputLabel || "")
+  });
+  return {
+    ok: Boolean(result && result.ok),
+    value: String(result?.value || "")
+  };
 }
 
 function reportLog(level, event, detail = {}) {
@@ -1104,6 +1211,32 @@ async function enrichRenewRowsWithPrice(force = false) {
   }
 }
 
+function queueRenewDueRefresh(summary, options = {}) {
+  const maxDays = Number.isFinite(Number(options.maxDays)) ? Number(options.maxDays) : 7;
+  const includeRenewPrice = Boolean(options.includeRenewPrice);
+  if (renewDueInflightPromise) return renewDueInflightPromise;
+  renewDueInflightPromise = (async () => {
+    try {
+      const rows = await collectRenewRowsFromSummary(summary, { maxDays, includeRenewPrice });
+      store.renewDueRows = rows;
+      store.renewDueCount = rows.length;
+      store.renewDueAt = Date.now();
+      store.renewDuePriceAt = includeRenewPrice ? Date.now() : 0;
+      return rows;
+    } catch (e) {
+      reportLog("WARN", "renew_due_count_error", { error: String(e) });
+      store.renewDueRows = [];
+      store.renewDueCount = 0;
+      store.renewDueAt = 0;
+      store.renewDuePriceAt = 0;
+      return [];
+    } finally {
+      renewDueInflightPromise = null;
+    }
+  })();
+  return renewDueInflightPromise;
+}
+
 async function refreshSummary(force = false) {
   if (!isAuthenticated()) return;
   if (!force && store.rawSummary && store.userProfile && hasFreshRenewRows()) {
@@ -1178,19 +1311,8 @@ async function refreshSummary(force = false) {
       store.summary = s;
       store.summarySource = source;
       store.lastSyncAt = new Date().toLocaleTimeString();
-      try {
-        const rows = await collectRenewRowsFromSummary(s, { maxDays: 7, includeRenewPrice: false });
-        store.renewDueRows = rows;
-        store.renewDueCount = rows.length;
-        store.renewDueAt = Date.now();
-        store.renewDuePriceAt = 0;
-      } catch (e) {
-        reportLog("WARN", "renew_due_count_error", { error: String(e) });
-        store.renewDueRows = [];
-        store.renewDueCount = 0;
-        store.renewDueAt = 0;
-        store.renewDuePriceAt = 0;
-      }
+      // 启动阶段不阻塞主流程，待续费统计后台更新。
+      queueRenewDueRefresh(s, { maxDays: 7, includeRenewPrice: false });
       if (summaryIsEmpty(s)) {
         toast("当前账号暂无产品数据");
       }
@@ -1464,6 +1586,18 @@ function buildDetailView(kind, id, detailData, monitorData) {
     const hasTrafficBase = Number(plan.traffic_base_gb || 0) > 0;
     const hasTrafficPrice = !!(plan.traffic_price && typeof plan.traffic_price === "object" && Object.keys(plan.traffic_price).length);
     const isTrafficMetered = chargeType.includes("traffic") || hasTrafficBase || hasTrafficPrice;
+    const osDetectText = `${String(d.OsName || "")} ${String(d.OsInfo?.name || "")} ${String(d.OsInfo?.chinese_name || "")}`.toLowerCase();
+    const isWindowsLike = String(d.OsInfo?.os_type || "").toLowerCase() === "windows" || osDetectText.includes("windows");
+    const hasBtPanel = osDetectText.includes("btpanel") || osDetectText.includes("宝塔") || osDetectText.includes("aapanel");
+    const panelHost = String(d.MainIPv4 || d.NatPublicIP || showIp || "").trim();
+    const panelUrl = hasBtPanel && panelHost ? `https://${panelHost}:8889/rainy` : "";
+    const remoteUserRaw = String(
+      pickFirstFieldDeep(d, ["UserName", "username", "user", "Account", "LoginUser", "RemoteUser", "SSHUser", "DefaultUser"]) || ""
+    ).trim();
+    const remoteUser = remoteUserRaw || (isWindowsLike ? "Administrator" : "root");
+    const remotePassword = String(
+      pickFirstFieldDeep(d, ["Password", "Passwd", "password", "passwd", "LoginPass", "RemotePassword", "SSHPassword", "DefaultPassword", "DefaultPass"]) || ""
+    ).trim();
 
     const serverInfo = {
       id: String(d.ID || id),
@@ -1471,6 +1605,13 @@ function buildDetailView(kind, id, detailData, monitorData) {
       status: d.Status || "-",
       node: node.ChineseName || d.Zone || node.Region || "-",
       expireAt,
+      os: d.OsInfo?.chinese_name || d.OsInfo?.english_name || d.OsName || "",
+      osType: d.OsInfo?.os_type || "",
+      remoteIp: showIp === "-" ? panelHost : String(showIp),
+      remoteUser,
+      remotePassword,
+      panelUrl,
+      panelEnabled: Boolean(panelUrl),
       showTraffic: isTrafficMetered,
       trafficLeft: d.TrafficBytes !== undefined ? formatBytes(d.TrafficBytes) : "-"
     };
@@ -1520,6 +1661,9 @@ function buildDetailView(kind, id, detailData, monitorData) {
       status: d.Status || "-",
       node: d.region?.chinese_name || d.region?.name || "-",
       expireAt,
+      remoteIp: "",
+      remoteUser: "",
+      remotePassword: "",
       showTraffic: false,
       trafficLeft: "-"
     };
@@ -1622,6 +1766,13 @@ function buildDetailView(kind, id, detailData, monitorData) {
       status: d.Status || "-",
       node: node.ChineseName || d.Zone || node.Region || "-",
       expireAt: gameExpireAt,
+      os: d.OsInfo?.chinese_name || d.OsInfo?.english_name || d.OsName || "",
+      osType: d.OsInfo?.os_type || "",
+      remoteIp: isMcsm ? String(accessHost || "") : (showIp === "-" ? "" : String(showIp)),
+      remoteUser: String(pickFirstFieldDeep(d, ["McsmUserName", "UserName", "username", "user", "Account", "LoginUser"]) || "").trim(),
+      remotePassword: String(pickFirstFieldDeep(d, ["McsmPasswd", "Password", "Passwd", "password", "passwd", "LoginPass", "DefaultPass"]) || "").trim(),
+      panelUrl: "",
+      panelEnabled: false,
       showTraffic: isTrafficMetered,
       trafficLeft: trafficBytes !== undefined ? formatBytes(trafficBytes) : "-"
     };
@@ -2094,6 +2245,9 @@ const TodoPage = {
 
     async function loadRenews() {
       await refreshSummary(false);
+      if (!hasFreshRenewRows()) {
+        await queueRenewDueRefresh(store.summary, { maxDays: 7, includeRenewPrice: false });
+      }
       const baseRows = Array.isArray(store.renewDueRows) ? store.renewDueRows.map((x) => ({ ...x })) : [];
       renewRows.value = baseRows;
       if (!baseRows.length) return;
@@ -2210,7 +2364,33 @@ const ProductListPage = {
         <div class="list-tip" v-if="keyword">匹配 {{ viewIds.length }} 项</div>
         <div v-if="!viewIds.length" class="empty">暂无匹配数据</div>
         <div v-else class="list-cards">
-          <button class="id-card" v-for="id in viewIds" :key="id" @click="openDetail(id)">
+          <button v-if="showRichCard" class="id-card detail-card" v-for="id in viewIds" :key="id" @click="openDetail(id)">
+            <div class="detail-card-main">
+              <div class="detail-card-head">
+                <b>#{{ id }}</b>
+                <span class="detail-card-status" :class="'is-' + getCardMeta(id).statusClass">
+                  <i class="fa-solid fa-circle"></i>{{ getCardMeta(id).statusText }}
+                </span>
+              </div>
+              <div class="detail-card-sub">{{ getCardMeta(id).nodeText }}</div>
+              <div class="detail-card-kv">
+                <span>IP {{ getCardMeta(id).ipText }}</span>
+                <span>到期 {{ getCardMeta(id).expireText }}</span>
+              </div>
+              <div class="detail-card-bars" v-if="getCardMeta(id).showMetrics">
+                <div class="mini-metric">
+                  <span>CPU {{ getCardMeta(id).cpuText }}</span>
+                  <i><em :style="{ width: getCardMeta(id).cpuBarPercent + '%' }"></em></i>
+                </div>
+                <div class="mini-metric">
+                  <span>内存 {{ getCardMeta(id).memText }}</span>
+                  <i><em :style="{ width: getCardMeta(id).memBarPercent + '%' }"></em></i>
+                </div>
+              </div>
+            </div>
+            <i class="fa-solid fa-chevron-right detail-card-arrow"></i>
+          </button>
+          <button v-else class="id-card" v-for="id in viewIds" :key="id" @click="openDetail(id)">
             <div><b>#{{ id }}</b><span>{{ kindLabel }}</span></div>
             <i class="fa-solid fa-chevron-right"></i>
           </button>
@@ -2230,16 +2410,129 @@ const ProductListPage = {
     const keyword = ref("");
     const asc = ref(true);
     const kindLabel = computed(() => getKindLabel(kind.value));
+    const detailMetaMap = ref({});
+    const showRichCard = computed(() => ["rcs", "rgpu", "rgs"].includes(String(kind.value || "")));
     const viewIds = computed(() => {
       const list = [...ids.value];
       const sorted = list.sort((a, b) => asc.value ? Number(a) - Number(b) : Number(b) - Number(a));
       if (!keyword.value) return sorted;
       return sorted.filter((id) => String(id).includes(keyword.value));
     });
+    const getStatusMeta = (raw) => {
+      const s = String(raw || "").toLowerCase();
+      if (s === "running") return { statusText: "运行中", statusClass: "running" };
+      if (s === "stopped" || s === "stop") return { statusText: "已停止", statusClass: "stopped" };
+      if (s) return { statusText: String(raw), statusClass: "unknown" };
+      return { statusText: "未知", statusClass: "unknown" };
+    };
+    const parsePercentText = (text) => {
+      const s = String(text || "").trim();
+      if (!s) return null;
+      const m = s.match(/(\d+(?:\.\d+)?)\s*%/);
+      const v = Number(m ? m[1] : s);
+      return Number.isFinite(v) ? Math.max(0, Math.min(100, v)) : null;
+    };
+    const toBarPercent = (v) => {
+      if (!Number.isFinite(v) || v <= 0) return 0;
+      if (v < 6) return 6;
+      return Math.max(0, Math.min(100, v));
+    };
+    const parseMemPercent = (text) => {
+      const s = String(text || "");
+      const m = s.match(/([0-9.]+)\s*([KMGTP]?B)\s*\/\s*([0-9.]+)\s*([KMGTP]?B)/i);
+      if (!m) return null;
+      const toBytes = (num, unit) => {
+        const n = Number(num);
+        if (!Number.isFinite(n)) return null;
+        const u = String(unit || "B").toUpperCase();
+        const map = { B: 1, KB: 1024, MB: 1024 ** 2, GB: 1024 ** 3, TB: 1024 ** 4, PB: 1024 ** 5 };
+        const multi = map[u] || 1;
+        return n * multi;
+      };
+      const used = toBytes(m[1], m[2]);
+      const total = toBytes(m[3], m[4]);
+      if (!Number.isFinite(used) || !Number.isFinite(total) || total <= 0) return null;
+      return Math.max(0, Math.min(100, (used / total) * 100));
+    };
+    const pickRowValue = (rows, key) => {
+      const row = Array.isArray(rows) ? rows.find((x) => String(x?.key || "") === key) : null;
+      return row ? String(row.value || "") : "";
+    };
+    const parseExpireBrief = (raw) => {
+      const s = String(raw || "").trim();
+      if (!s || s === "-") return "-";
+      const m = s.match(/(\d{4}[-\/]\d{1,2}[-\/]\d{1,2})/);
+      return m ? m[1].replace(/\//g, "-") : s;
+    };
+    const toCardMeta = (id, detailPayload) => {
+      const detailData = extractPayloadData(detailPayload);
+      const view = buildDetailView(kind.value, id, detailData, null) || {};
+      const info = view.serverInfo || {};
+      const baseRows = Array.isArray(view.baseInfo) ? view.baseInfo : [];
+      const monitorRows = Array.isArray(view.monitorRows) ? view.monitorRows : [];
+      const status = getStatusMeta(info.status);
+      const cpuText = pickRowValue(monitorRows, "CPU(%)") || "-";
+      const memText = pickRowValue(monitorRows, "内存使用") || "-";
+      const cpuPercent = parsePercentText(cpuText) ?? 0;
+      const memPercent = parseMemPercent(memText) ?? 0;
+      return {
+        statusText: status.statusText,
+        statusClass: status.statusClass,
+        nodeText: String(info.node || "-"),
+        ipText: String(info.remoteIp || "-"),
+        expireText: parseExpireBrief(String(info.expireAt || "-")),
+        cpuText,
+        memText,
+        cpuPercent,
+        memPercent,
+        cpuBarPercent: toBarPercent(cpuPercent),
+        memBarPercent: toBarPercent(memPercent),
+        showMetrics: cpuText !== "-" || memText !== "-"
+      };
+    };
+    const getCardMeta = (id) => {
+      const key = String(id);
+      const meta = detailMetaMap.value[key];
+      if (meta) return meta;
+      return {
+        statusText: "加载中",
+        statusClass: "unknown",
+        nodeText: kindLabel.value,
+        ipText: "-",
+        expireText: "-",
+        cpuText: "-",
+        memText: "-",
+        cpuPercent: 0,
+        memPercent: 0,
+        cpuBarPercent: 0,
+        memBarPercent: 0,
+        showMetrics: false
+      };
+    };
+    const loadCardMeta = async (force = false) => {
+      const kindName = String(kind.value || "");
+      if (!showRichCard.value) return;
+      const targets = viewIds.value.slice(0, 20).map((x) => String(x));
+      if (!targets.length) return;
+      for (const id of targets) {
+        if (!force && detailMetaMap.value[id]) continue;
+        try {
+          const detailKind = kindName === "rgpu" ? "rcs" : kindName;
+          const detailPath = `/product/${detailKind}/${id}/`;
+          const payload = await apiGet(detailPath, { force, ttlMs: 15000 });
+          const meta = toCardMeta(id, payload);
+          detailMetaMap.value = { ...detailMetaMap.value, [id]: meta };
+        } catch {
+          const fallback = getCardMeta(id);
+          detailMetaMap.value = { ...detailMetaMap.value, [id]: { ...fallback, statusText: "获取失败" } };
+        }
+      }
+    };
     const openDetail = (id) => router.push(`/product/${kind.value}/${id}`);
     const toggleSort = () => { asc.value = !asc.value; };
     const refresh = async () => {
       await refreshSummary(true);
+      await loadCardMeta(true);
       toast("产品列表已刷新");
     };
     const copyAllIds = async () => {
@@ -2257,7 +2550,12 @@ const ProductListPage = {
       } catch {
         // fallback
       }
-      window.prompt("复制ID列表", text);
+      await appPrompt("复制ID列表", text, {
+        message: "复制失败，请手动复制以下内容",
+        confirmText: "关闭",
+        cancelText: "取消",
+        inputLabel: "ID 列表"
+      });
     };
     const openMainSite = () => {
       const kindName = String(kind.value || "");
@@ -2269,8 +2567,15 @@ const ProductListPage = {
       };
       window.open(map[kindName] || "https://app.rainyun.com/", "_blank");
     };
-    onMounted(() => refreshSummary(false));
-    return { ids, kindLabel, viewIds, keyword, asc, openDetail, toggleSort, refresh, copyAllIds, openMainSite };
+    watch([kind, viewIds], () => {
+      loadCardMeta(false);
+    }, { immediate: false });
+
+    onMounted(async () => {
+      await refreshSummary(false);
+      await loadCardMeta(false);
+    });
+    return { ids, kindLabel, viewIds, keyword, asc, showRichCard, openDetail, toggleSort, refresh, copyAllIds, openMainSite, getCardMeta };
   }
 };
 
@@ -2303,6 +2608,30 @@ const ProductDetailPage = {
           <div class="server-row"><span>{{ kind === 'rca' ? '区域' : '节点' }}</span><b>{{ serverInfo.node }}</b></div>
           <div class="server-row"><span>到期日期</span><b>{{ serverInfo.expireAt }}</b></div>
           <div class="server-row" v-if="serverInfo.showTraffic"><span>剩余流量</span><b>{{ serverInfo.trafficLeft }}</b></div>
+          <div v-if="canOperatePower" class="remote-info-block">
+            <div class="server-row server-row-remote">
+              <span>公网 IP 地址</span>
+              <div class="remote-cell">
+                <b>{{ serverInfo.remoteIp || '-' }}</b>
+                <button class="remote-action-btn" @click="copyRemoteIp">复制</button>
+              </div>
+            </div>
+            <div class="server-row server-row-remote">
+              <span>远程用户名</span>
+              <div class="remote-cell">
+                <b>{{ serverInfo.remoteUser || '-' }}</b>
+                <button class="remote-action-btn" @click="copyRemoteUser">复制</button>
+              </div>
+            </div>
+            <div class="server-row server-row-remote">
+              <span>远程密码</span>
+              <div class="remote-cell">
+                <b>{{ remotePasswordText }}</b>
+                <button class="remote-action-btn" @click="copyRemotePassword">复制</button>
+                <button class="remote-action-btn" @click="toggleRemotePassword">{{ remotePasswordVisible ? '隐藏' : '查看' }}</button>
+              </div>
+            </div>
+          </div>
         </div>
         <div v-if="canOperatePower" class="detail-quick-actions">
           <div class="panel-title mini">
@@ -2310,12 +2639,13 @@ const ProductDetailPage = {
             <a-typography-text class="panel-subtext" type="secondary">服务器控制与远程连接</a-typography-text>
           </div>
           <div class="action-grid quick-actions-grid">
-            <a-button class="line-btn" size="medium" type="outline" @click="copyProductId">复制ID</a-button>
-            <a-button class="line-btn" size="medium" type="outline" @click="startServer">开机</a-button>
-            <a-button class="line-btn" size="medium" type="outline" @click="rebootServer">重启</a-button>
-            <a-button class="line-btn" size="medium" type="outline" @click="stopServer">关机</a-button>
-            <a-button class="line-btn" size="medium" type="outline" :disabled="vncLoading" @click="openVnc('xtermjs')">Xtermjs</a-button>
-            <a-button class="line-btn" size="medium" type="outline" :disabled="vncLoading" @click="openVnc('novnc')">NoVNC</a-button>
+            <a-button class="line-btn op-neutral" size="medium" type="outline" @click="copyProductId">复制ID</a-button>
+            <a-button class="line-btn op-start" size="medium" type="outline" @click="startServer">开机</a-button>
+            <a-button class="line-btn op-neutral" size="medium" type="outline" @click="rebootServer">重启</a-button>
+            <a-button class="line-btn op-stop" size="medium" type="outline" @click="stopServer">关机</a-button>
+            <a-button v-if="showBtPanelButton" class="line-btn op-panel" size="medium" type="outline" @click="openBtPanel">宝塔面板</a-button>
+            <a-button v-if="showXtermButton" class="line-btn op-console" size="medium" type="outline" :disabled="vncLoading" @click="openVnc('xtermjs')">Xtermjs</a-button>
+            <a-button class="line-btn op-console" size="medium" type="outline" :disabled="vncLoading" @click="openVnc('novnc')">NoVNC</a-button>
           </div>
           <div v-if="vncLoading" class="vnc-loading-tip">正在获取 VNC 地址...</div>
           <div v-if="opLoading" class="vnc-loading-tip">正在执行操作...</div>
@@ -2396,6 +2726,13 @@ const ProductDetailPage = {
       status: "-",
       node: "-",
       expireAt: "-",
+      os: "",
+      osType: "",
+      remoteIp: "",
+      remoteUser: "",
+      remotePassword: "",
+      panelUrl: "",
+      panelEnabled: false,
       showTraffic: false,
       trafficLeft: "-"
     });
@@ -2424,13 +2761,74 @@ const ProductDetailPage = {
     const vncUrl = ref("");
     const autoRefreshAt = ref("");
     const detailRefreshing = ref(false);
+    const remotePasswordVisible = ref(false);
     let detailAutoRefreshTimer = null;
     const canOperatePower = computed(() => kind.value === "rcs" || kind.value === "rgpu");
+    const isWindowsServer = computed(() => {
+      const osType = String(serverInfo.value.osType || "").toLowerCase();
+      if (osType === "windows") return true;
+      const osText = String(serverInfo.value.os || "").toLowerCase();
+      if (!osText) return false;
+      return osText.includes("windows") || osText.includes("win server") || osText.includes("win10") || osText.includes("win11") || osText.includes("win201");
+    });
+    const showXtermButton = computed(() => canOperatePower.value && !isWindowsServer.value);
+    const showBtPanelButton = computed(() => canOperatePower.value && Boolean(serverInfo.value.panelEnabled && serverInfo.value.panelUrl));
     const autoRefreshText = computed(() => {
       const base = `自动更新：每 ${Math.floor(DETAIL_AUTO_REFRESH_MS / 1000)} 秒`;
       if (!autoRefreshAt.value) return base;
       return `${base}（上次 ${autoRefreshAt.value}）`;
     });
+    const remotePasswordText = computed(() => {
+      const raw = String(serverInfo.value.remotePassword || "").trim();
+      if (!raw) return "-";
+      if (remotePasswordVisible.value) return raw;
+      const size = Math.max(8, Math.min(20, raw.length));
+      return "*".repeat(size);
+    });
+
+    async function copyWithFallback(label, text) {
+      const v = String(text || "").trim();
+      if (!v || v === "-") {
+        toast(`暂无可复制${label}`);
+        return;
+      }
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(v);
+          toast(`${label}已复制`);
+          return;
+        }
+      } catch {
+        // ignore
+      }
+      await appPrompt(`复制${label}`, v, {
+        message: "复制失败，请手动复制以下内容",
+        confirmText: "关闭",
+        cancelText: "取消",
+        inputLabel: label
+      });
+    }
+
+    async function copyRemoteIp() {
+      await copyWithFallback("公网IP", serverInfo.value.remoteIp);
+    }
+
+    async function copyRemoteUser() {
+      await copyWithFallback("远程用户名", serverInfo.value.remoteUser);
+    }
+
+    async function copyRemotePassword() {
+      await copyWithFallback("远程密码", serverInfo.value.remotePassword);
+    }
+
+    function toggleRemotePassword() {
+      const raw = String(serverInfo.value.remotePassword || "").trim();
+      if (!raw) {
+        toast("暂无远程密码信息");
+        return;
+      }
+      remotePasswordVisible.value = !remotePasswordVisible.value;
+    }
     function parseSizeToBytes(num, unit) {
       const n = Number(num);
       if (!Number.isFinite(n)) return null;
@@ -2541,22 +2939,22 @@ const ProductDetailPage = {
     });
 
     function endpointFor(kindName, productId) {
-      if (kindName === "rcs") {
-        return {
-          detail: `/product/rcs/${productId}/`,
-          monitor: `/product/rcs/${productId}/monitor`,
-          detailCandidates: [],
-          monitorCandidates: []
-        };
-      }
-      if (kindName === "rgpu") {
-        return {
-          detail: `/product/rcs/${productId}/`,
-          monitor: `/product/rcs/${productId}/monitor`,
-          detailCandidates: [],
-          monitorCandidates: []
-        };
-      }
+    if (kindName === "rcs") {
+      return {
+        detail: `/product/rcs/${productId}/`,
+        monitor: "",
+        detailCandidates: [],
+        monitorCandidates: []
+      };
+    }
+    if (kindName === "rgpu") {
+      return {
+        detail: `/product/rcs/${productId}/`,
+        monitor: "",
+        detailCandidates: [],
+        monitorCandidates: []
+      };
+    }
       if (kindName === "rgs") {
         return {
           detail: `/product/rgs/${productId}/`,
@@ -2603,7 +3001,8 @@ const ProductDetailPage = {
         errorText.value = "";
         opErrorText.value = "";
         baseInfo.value = [];
-        serverInfo.value = { id: "-", tag: "未设定", status: "-", node: "-", expireAt: "-", showTraffic: false, trafficLeft: "-" };
+        serverInfo.value = { id: "-", tag: "未设定", status: "-", node: "-", expireAt: "-", os: "", osType: "", remoteIp: "", remoteUser: "", remotePassword: "", panelUrl: "", panelEnabled: false, showTraffic: false, trafficLeft: "-" };
+        remotePasswordVisible.value = false;
         configRows.value = [];
         monitorRows.value = [];
       }
@@ -2665,6 +3064,7 @@ const ProductDetailPage = {
         const view = buildDetailView(kind.value, id.value, detailData, monitorData);
         baseInfo.value = view.baseInfo;
         if (view.serverInfo) serverInfo.value = view.serverInfo;
+        remotePasswordVisible.value = false;
         configRows.value = view.configRows.length ? view.configRows : [{ key: "提示", value: "接口暂无可展示配置字段" }];
         if (!monitorRows.value.length) {
           monitorRows.value = view.monitorRows;
@@ -2741,7 +3141,26 @@ const ProductDetailPage = {
       } catch {
         // ignore
       }
-      window.prompt("复制产品ID", text);
+      await appPrompt("复制产品ID", text, {
+        message: "复制失败，请手动复制以下内容",
+        confirmText: "关闭",
+        cancelText: "取消",
+        inputLabel: "产品 ID"
+      });
+    }
+
+    async function openBtPanel() {
+      const url = String(serverInfo.value.panelUrl || "").trim();
+      if (!url) {
+        toast("未检测到可用的宝塔面板地址");
+        return;
+      }
+      const ok = await appConfirm(
+        "将打开宝塔管理面板（https://IP:8889/rainy）。\n若无法访问，请确认安全组/防火墙已放行并检查证书提示。",
+        { title: "打开宝塔面板", confirmText: "继续打开", cancelText: "取消" }
+      );
+      if (!ok) return;
+      window.open(url, "_blank");
     }
 
     function controlPath(action) {
@@ -2761,7 +3180,11 @@ const ProductDetailPage = {
         return;
       }
       const actionMap = { start: "开机", reboot: "重启", stop: "关机" };
-      const ok = window.confirm(`确认${actionMap[action] || "执行"}该服务器吗？`);
+      const ok = await appConfirm(`确认${actionMap[action] || "执行"}该服务器吗？`, {
+        title: "服务器操作确认",
+        confirmText: "确认",
+        cancelText: "取消"
+      });
       if (!ok) return;
       opLoading.value = true;
       opErrorText.value = "";
@@ -2883,18 +3306,27 @@ const ProductDetailPage = {
       goList,
       canOperatePower,
       copyProductId,
+      copyRemoteIp,
+      copyRemoteUser,
+      copyRemotePassword,
+      toggleRemotePassword,
+      remotePasswordVisible,
+      remotePasswordText,
       startServer,
       rebootServer,
       stopServer,
       openVnc,
       closeVnc,
+      openBtPanel,
       vncShow,
       vncLoading,
       vncUrl,
       opLoading,
       opErrorText,
       opApiPath,
-      autoRefreshText
+      autoRefreshText,
+      showBtPanelButton,
+      showXtermButton
     };
   }
 };
@@ -3578,7 +4010,10 @@ const MePage = {
         }
         const target = info.downloadUrl || UPDATE_BASE_URL;
         const notes = formatUpdateNotesForDialog(info.notes);
-        const ok = confirm(`发现新版本 ${info.version}\n当前版本 ${APP_VERSION}\n\n更新说明：\n${notes}\n\n是否立即下载？`);
+        const ok = await appConfirm(
+          `发现新版本 ${info.version}\n当前版本 ${APP_VERSION}\n\n更新说明：\n${notes}\n\n是否立即下载？`,
+          { title: "版本更新", confirmText: "立即下载", cancelText: "稍后" }
+        );
         if (!ok) return;
         window.open(target, "_blank");
       } catch (e) {
@@ -3641,16 +4076,43 @@ const RootApp = {
           <component :is="Component" :key="route.fullPath" />
         </transition>
       </router-view>
+      <transition :css="false" @enter="onDialogEnter" @leave="onDialogLeave">
+        <div v-if="dialog.visible" class="app-dialog-mask" @click.self="onDialogCancel">
+          <div class="app-dialog" role="dialog" aria-modal="true">
+            <div class="app-dialog-head">
+              <h3>{{ dialog.title }}</h3>
+            </div>
+            <div class="app-dialog-body">
+              <p v-if="dialog.message" class="app-dialog-message">{{ dialog.message }}</p>
+              <template v-if="dialog.mode === 'prompt'">
+                <label v-if="dialog.inputLabel" class="app-dialog-label">{{ dialog.inputLabel }}</label>
+                <input
+                  class="app-dialog-input"
+                  :value="dialog.inputValue"
+                  :placeholder="dialog.inputPlaceholder"
+                  @input="dialog.inputValue = $event.target.value"
+                  @keydown.enter.prevent="onDialogConfirm"
+                />
+              </template>
+            </div>
+            <div class="app-dialog-actions">
+              <button v-if="dialog.showCancel" class="line-btn" @click="onDialogCancel">{{ dialog.cancelText }}</button>
+              <button class="line-btn primary-btn" @click="onDialogConfirm">{{ dialog.confirmText }}</button>
+            </div>
+          </div>
+        </div>
+      </transition>
     </div>
   `,
   setup() {
     const loading = computed(() => store.loading);
     const bootVisible = ref(true);
     const minBootElapsed = ref(false);
-    const bootProgress = ref(4);
+    const bootProgress = ref(12);
     const bootMode = ref("animated");
     const reducedMotion = ref(false);
     let progressTimer = null;
+    let forceCloseTimer = null;
     let bootStartAt = Date.now();
     let bootClosing = false;
     const bootExpectedMs = ref(BOOT_EXPECTED_FALLBACK_MS);
@@ -3735,8 +4197,78 @@ const RootApp = {
       ).finished.then(done).catch(done);
     };
 
-    const tryCloseBoot = () => {
-      if (!minBootElapsed.value || loading.value || bootClosing) return;
+    const onDialogEnter = (el, done) => {
+      if (prefersReducedMotion()) {
+        el.style.opacity = "1";
+        const panel = el.querySelector(".app-dialog");
+        if (panel) {
+          panel.style.opacity = "1";
+          panel.style.transform = "none";
+        }
+        const input = el.querySelector(".app-dialog-input");
+        if (input && typeof input.focus === "function") {
+          input.focus();
+          if (typeof input.select === "function") input.select();
+        }
+        done();
+        return;
+      }
+      const panel = el.querySelector(".app-dialog");
+      const fade = animate(el, [{ opacity: 0 }, { opacity: 1 }], { duration: 0.18, easing: "ease-out" }).finished;
+      const pop = panel
+        ? animate(
+          panel,
+          [
+            { opacity: 0, transform: "translate3d(0, 12px, 0) scale(0.97)" },
+            { opacity: 1, transform: "translate3d(0, 0, 0) scale(1)" }
+          ],
+          { duration: 0.24, easing: "cubic-bezier(.22,1,.36,1)" }
+        ).finished
+        : Promise.resolve();
+      Promise.all([fade, pop]).then(() => {
+        const input = el.querySelector(".app-dialog-input");
+        if (input && typeof input.focus === "function") {
+          input.focus();
+          if (typeof input.select === "function") input.select();
+        }
+        done();
+      }).catch(done);
+    };
+
+    const onDialogLeave = (el, done) => {
+      if (prefersReducedMotion()) {
+        el.style.opacity = "0";
+        done();
+        return;
+      }
+      const panel = el.querySelector(".app-dialog");
+      const fade = animate(el, [{ opacity: 1 }, { opacity: 0 }], { duration: 0.15, easing: "ease-out" }).finished;
+      const pop = panel
+        ? animate(
+          panel,
+          [
+            { opacity: 1, transform: "translate3d(0, 0, 0) scale(1)" },
+            { opacity: 0, transform: "translate3d(0, 8px, 0) scale(0.985)" }
+          ],
+          { duration: 0.15, easing: "ease-out" }
+        ).finished
+        : Promise.resolve();
+      Promise.all([fade, pop]).then(done).catch(done);
+    };
+
+    const onDialogCancel = () => {
+      if (!appDialogState.showCancel) return;
+      if (Date.now() - Number(appDialogState.openedAt || 0) < 180) return;
+      closeAppDialog({ ok: false, value: String(appDialogState.inputValue || "") });
+    };
+
+    const onDialogConfirm = () => {
+      closeAppDialog({ ok: true, value: String(appDialogState.inputValue || "") });
+    };
+
+    const tryCloseBoot = (force = false) => {
+      if (!force && (!minBootElapsed.value || loading.value)) return;
+      if (bootClosing) return;
       bootClosing = true;
       bootProgress.value = Math.max(bootProgress.value, 97);
       setTimeout(() => {
@@ -3755,10 +4287,10 @@ const RootApp = {
       const expected = clamp(Number(bootExpectedMs.value) || BOOT_EXPECTED_FALLBACK_MS, BOOT_EXPECTED_MIN_MS, BOOT_EXPECTED_MAX_MS);
       const ratio = clamp(elapsed / expected, 0, 1);
       const eased = 1 - ((1 - ratio) ** 2.2);
-      const cap = minBootElapsed.value && !loading.value ? 100 : 96;
-      const base = 4;
+      const cap = minBootElapsed.value && !loading.value ? 100 : 94;
+      const base = 12;
       const target = clamp(base + (cap - base) * eased, base, cap);
-      const next = Math.min(cap, Math.max(bootProgress.value + 0.8, target));
+      const next = Math.min(cap, Math.max(bootProgress.value + 1.2, target));
       if (next > bootProgress.value) {
         bootProgress.value = Number(next.toFixed(2));
       }
@@ -3779,11 +4311,15 @@ const RootApp = {
           bootMode.value = "progress";
         }
       }
-      progressTimer = setInterval(tickBootProgress, 80);
+      progressTimer = setInterval(tickBootProgress, 60);
       setTimeout(() => {
         minBootElapsed.value = true;
         tryCloseBoot();
       }, BOOT_MIN_VISIBLE_MS);
+      forceCloseTimer = setTimeout(() => {
+        // 主流程异常变慢时，优先让用户进入页面并保留顶部 loading 条。
+        tryCloseBoot(true);
+      }, BOOT_FORCE_CLOSE_MS);
     });
 
     watch(loading, () => {
@@ -3795,16 +4331,43 @@ const RootApp = {
         clearInterval(progressTimer);
         progressTimer = null;
       }
+      if (!v && forceCloseTimer) {
+        clearTimeout(forceCloseTimer);
+        forceCloseTimer = null;
+      }
     });
 
     onUnmounted(() => {
+      if (progressTimer) {
+        clearInterval(progressTimer);
+        progressTimer = null;
+      }
+      if (forceCloseTimer) {
+        clearTimeout(forceCloseTimer);
+        forceCloseTimer = null;
+      }
       if (typeof window !== "undefined") {
         window.removeEventListener("resize", syncAppViewportHeight);
         window.removeEventListener("orientationchange", syncAppViewportHeight);
       }
     });
 
-    return { loading, bootVisible, bootProgress, bootMode, logo: BRAND_LOGO, onBootEnter, onBootLeave, onPageEnter, onPageLeave };
+    return {
+      loading,
+      bootVisible,
+      bootProgress,
+      bootMode,
+      logo: BRAND_LOGO,
+      dialog: appDialogState,
+      onBootEnter,
+      onBootLeave,
+      onPageEnter,
+      onPageLeave,
+      onDialogEnter,
+      onDialogLeave,
+      onDialogCancel,
+      onDialogConfirm
+    };
   }
 };
 
@@ -3868,6 +4431,12 @@ async function setupAndroidBackHandler() {
 }
 
 setupAndroidBackHandler();
+applySeasonBackground();
+if (typeof document !== "undefined") {
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) applySeasonBackground();
+  });
+}
 
 createApp(RootApp).use(AButton).use(AInput).use(ATag).use(ATypography).use(router).mount("#app");
 
