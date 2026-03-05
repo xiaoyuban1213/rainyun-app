@@ -13,7 +13,7 @@ import "@arco-design/web-vue/es/typography/style/css.js";
 
 const BRAND_LOGO = new URL("./assets/icons/app-icon-20260228.jpg", import.meta.url).href;
 const AVATAR = new URL("./assets/images/default-avatar.svg", import.meta.url).href;
-const APP_VERSION = "1.1.5";
+const APP_VERSION = "1.1.6";
 const SEASON_BG_MAP = {
   spring: "https://forum.rainyun.com/uploads/default/original/2X/c/c945ac6e94feae902f54476fd53c65cc74d027fb.webp",
   summer: "https://forum.rainyun.com/uploads/default/original/2X/b/b89be1c923371d70912118bc3038cee6f1f77f0f.webp",
