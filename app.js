@@ -13,7 +13,7 @@ import "@arco-design/web-vue/es/typography/style/css.js";
 
 const BRAND_LOGO = new URL("./assets/icons/app-icon-20260228.jpg", import.meta.url).href;
 const AVATAR = new URL("./assets/images/default-avatar.svg", import.meta.url).href;
-const APP_VERSION = "1.1.6";
+const APP_VERSION = "1.1.7";
 const SEASON_BG_MAP = {
   spring: "https://forum.rainyun.com/uploads/default/original/2X/c/c945ac6e94feae902f54476fd53c65cc74d027fb.webp",
   summer: "https://forum.rainyun.com/uploads/default/original/2X/b/b89be1c923371d70912118bc3038cee6f1f77f0f.webp",
@@ -150,6 +150,11 @@ const TENCENT_CAPTCHA_APP_ID = "2039519451";
 const apiRequestLogBuffer = [];
 const apiRequestLogRecentMap = new Map();
 const apiRequestPreferredBase = { value: "", at: 0 };
+const rgsMcsmPanelUsersCache = {
+  at: 0,
+  items: null,
+  promise: null
+};
 let apiRequestLogFlushTimer = null;
 let apiRequestLogHooksInited = false;
 
@@ -1911,7 +1916,144 @@ function formatRate(value) {
   return `${(n / 1024 ** 2).toFixed(2)} MB/s`;
 }
 
-function buildDetailView(kind, id, detailData, monitorData) {
+function getRgsServiceTypeLabel(raw) {
+  const subtype = String(raw || "").trim().toLowerCase();
+  if (!subtype) return "-";
+  if (subtype.includes("mcsm")) return "MCSM 面板";
+  if (subtype.includes("k8s_panel")) return "雨云面板";
+  if (subtype.includes("kvm")) return "VPS 服务器";
+  return String(raw);
+}
+
+function getRgsIpModeLabel(detailEnvelope, dataRoot) {
+  const d = dataRoot && typeof dataRoot === "object" ? dataRoot : {};
+  const eipList = Array.isArray(detailEnvelope?.EIPList) ? detailEnvelope.EIPList : (Array.isArray(d.EIPList) ? d.EIPList : []);
+  const natList = Array.isArray(detailEnvelope?.NatList) ? detailEnvelope.NatList : (Array.isArray(d.NatList) ? d.NatList : []);
+  const mainIpv4 = String(d.MainIPv4 || d.PublicIPv4 || d.IP || "").trim();
+  const natPublicIp = String(d.NatPublicIP || "").trim();
+  const natDomain = String(d.NatPublicDomain || d.NATSpareDomain || "").trim();
+  if (eipList.length > 0) return "公网IP";
+  if (mainIpv4 && mainIpv4 !== "-" && !mainIpv4.startsWith("172.") && !mainIpv4.startsWith("10.") && !mainIpv4.startsWith("192.168.")) {
+    return "公网IP";
+  }
+  if (natList.length > 0 || (natPublicIp && natPublicIp !== "-") || natDomain) {
+    return "NAT 共享IP";
+  }
+  return "-";
+}
+
+function getRgsSubtype(detailEnvelope, dataRoot) {
+  const d = dataRoot && typeof dataRoot === "object" ? dataRoot : {};
+  const plan = d.Plan && typeof d.Plan === "object" ? d.Plan : {};
+  const node = d.Node && typeof d.Node === "object" ? d.Node : {};
+  return String(plan.subtype || node.Subtype || d.Subtype || detailEnvelope?.Subtype || "").toLowerCase();
+}
+
+function pickRgsKvmAddress(detailEnvelope, dataRoot) {
+  const d = dataRoot && typeof dataRoot === "object" ? dataRoot : {};
+  const direct = [
+    d.MainIPv4,
+    d.PublicIPv4,
+    d.PublicIP,
+    d.MainIP,
+    d.NatPublicIP,
+    d.IP
+  ]
+    .map((x) => String(x || "").trim())
+    .find((x) => x && x !== "-");
+  if (direct) return direct;
+  const eipList = Array.isArray(detailEnvelope?.EIPList) ? detailEnvelope.EIPList : (Array.isArray(d.EIPList) ? d.EIPList : []);
+  const ipv4 = eipList
+    .map((x) => String(x?.IP || "").trim())
+    .find((x) => /^\d{1,3}(?:\.\d{1,3}){3}$/.test(x));
+  return ipv4 || "-";
+}
+
+function getRgsMcsmAccessHost(dataRoot) {
+  const d = dataRoot && typeof dataRoot === "object" ? dataRoot : {};
+  return String(d.NatPublicDomain || d.NATSpareDomain || d.NatPublicIP || "-").trim() || "-";
+}
+
+const RGS_MCSM_PASSWORD_SUFFIX = "Ry6!";
+
+function normalizeRgsMcsmPassword(value) {
+  const base = String(value || "").trim();
+  if (!base) return "";
+  return base.endsWith(RGS_MCSM_PASSWORD_SUFFIX) ? base : `${base}${RGS_MCSM_PASSWORD_SUFFIX}`;
+}
+
+function buildRgsMcsmPanelUrl(detailEnvelope, dataRoot, panelUser, panelPassword) {
+  const detail = detailEnvelope && typeof detailEnvelope === "object" ? detailEnvelope : {};
+  const d = dataRoot && typeof dataRoot === "object" ? dataRoot : {};
+  const username = String(panelUser || d.McsmUserName || d.McsmUser?.name || "").trim();
+  const password = normalizeRgsMcsmPassword(panelPassword || d.McsmUser?.password || "");
+  const daemonId = String(d.DaemonUUID || detail.DaemonUUID || "").trim();
+  const instanceId = String(d.ServerUUID || detail.ServerUUID || "").trim();
+  if (!username || !password || !daemonId || !instanceId) return "";
+  const redirect = `/#/instances/terminal?daemonId=${encodeURIComponent(daemonId)}&instanceId=${encodeURIComponent(instanceId)}`;
+  return `https://mcsm.rainyun.com/#/login?usr=${encodeURIComponent(username)}&pwd=${encodeURIComponent(password)}&rdt=${encodeURIComponent(redirect)}`;
+}
+
+function normalizeRgsMcsmPanelUsers(payload) {
+  const data = extractPayloadData(payload);
+  const rows = Array.isArray(data)
+    ? data
+    : (data && typeof data === "object" ? Object.values(data) : []);
+  return rows
+    .filter((row) => row && typeof row === "object")
+    .map((row) => ({
+      name: String(row.name || row.username || "").trim(),
+      password: String(row.password || row.passwd || "").trim(),
+      panelUuid: String(row.panel_uuid || row.panelUuid || "").trim()
+    }))
+    .filter((row) => row.name);
+}
+
+async function fetchRgsMcsmPanelUsers(force = false) {
+  const now = Date.now();
+  if (!force && Array.isArray(rgsMcsmPanelUsersCache.items) && now - Number(rgsMcsmPanelUsersCache.at || 0) < API_TTL_META_MS) {
+    return rgsMcsmPanelUsersCache.items;
+  }
+  if (!force && rgsMcsmPanelUsersCache.promise) {
+    return rgsMcsmPanelUsersCache.promise;
+  }
+  const p = (async () => {
+    const payload = await apiGet("/product/rgs/mcsm/panel_user/", force ? { force: true, ttlMs: 0 } : { ttlMs: API_TTL_META_MS });
+    const items = normalizeRgsMcsmPanelUsers(payload);
+    rgsMcsmPanelUsersCache.items = items;
+    rgsMcsmPanelUsersCache.at = Date.now();
+    return items;
+  })().finally(() => {
+    rgsMcsmPanelUsersCache.promise = null;
+  });
+  rgsMcsmPanelUsersCache.promise = p;
+  return p;
+}
+
+async function resolveRgsMcsmPanelCredentials(detailData, force = false) {
+  const d = detailData && detailData.Data && typeof detailData.Data === "object" ? detailData.Data : detailData;
+  const targetName = String(d?.McsmUserName || d?.McsmUser?.name || "").trim();
+  if (!targetName) {
+    return { panelUser: "", panelPassword: "" };
+  }
+  try {
+    const rows = await fetchRgsMcsmPanelUsers(force);
+    const match = rows.find((row) => String(row.name || "") === targetName);
+    const fallbackPassword = String(d?.McsmUser?.password || "").trim();
+    return {
+      panelUser: String(match?.name || targetName).trim(),
+      panelPassword: normalizeRgsMcsmPassword(match?.password || fallbackPassword)
+    };
+  } catch (e) {
+    reportLog("WARN", "rgs_mcsm_panel_user_unavailable", { user: targetName, error: String(e) });
+    return {
+      panelUser: targetName,
+      panelPassword: normalizeRgsMcsmPassword(d?.McsmUser?.password || "")
+    };
+  }
+}
+
+function buildDetailView(kind, id, detailData, monitorData, options = {}) {
   const detailEnvelope = detailData && typeof detailData === "object" ? detailData : {};
   const dataRoot = detailData && typeof detailData === "object" && detailData.Data && typeof detailData.Data === "object"
     ? detailData.Data
@@ -1962,7 +2104,6 @@ function buildDetailView(kind, id, detailData, monitorData) {
     const plan = d.Plan || {};
     const node = d.Node || {};
     const usage = d.UsageData || {};
-    const counts = addonCounts(d);
     const eipList = Array.isArray(detailEnvelope.EIPList) ? detailEnvelope.EIPList : (Array.isArray(d.EIPList) ? d.EIPList : []);
     const ipv6 = eipList.find((x) => String(x.Type || "").toLowerCase().includes("ipv6"));
     const showIp = (ipv6 && ipv6.IP) || d.NatPublicIP || d.MainIPv4 || "-";
@@ -1981,11 +2122,7 @@ function buildDetailView(kind, id, detailData, monitorData) {
       { key: "系统盘", value: `${String(d.Disk ?? "-")} GB` },
       { key: "上行带宽", value: `${String(d.NetIn ?? plan.net_in ?? "-")} Mbps` },
       { key: "下行带宽", value: `${String(d.NetOut ?? plan.net_out ?? "-")} Mbps` },
-      { key: "系统", value: d.OsInfo?.chinese_name || d.OsName || "-" },
-      { key: "备份数量", value: `${String(counts.rbs)} 个` },
-      { key: "数据盘", value: `${String(counts.eDisk)} 个` },
-      { key: "IP数量", value: `${String(counts.ipCount)} 个` },
-      { key: "私有网络", value: `${String(counts.vnetCount)} 个` }
+      { key: "系统", value: d.OsInfo?.chinese_name || d.OsName || "-" }
     ];
     const memoryPercent = usage.FreeMem !== undefined && usage.MaxMem !== undefined && Number(usage.MaxMem) > 0
       ? (Math.max(0, Number(usage.MaxMem) - Number(usage.FreeMem)) / Number(usage.MaxMem)) * 100
@@ -2100,16 +2237,15 @@ function buildDetailView(kind, id, detailData, monitorData) {
     const node = d.Node || d.node || {};
     const usage = d.UsageData || d.usage_data || d.usage || {};
     const natList = Array.isArray(detailEnvelope.NatList) ? detailEnvelope.NatList : (Array.isArray(d.NatList) ? d.NatList : []);
-    const counts = addonCounts(d);
-    const eipList = Array.isArray(detailEnvelope.EIPList) ? detailEnvelope.EIPList : (Array.isArray(d.EIPList) ? d.EIPList : []);
-    const ipv6 = eipList.find((x) => String(x.Type || "").toLowerCase().includes("ipv6"));
-    const showIp = (ipv6 && ipv6.IP) || d.NatPublicIP || d.MainIPv4 || d.IP || "-";
-    const subtype = String(plan.subtype || node.Subtype || d.Subtype || "").toLowerCase();
+    const showIp = pickRgsKvmAddress(detailEnvelope, d);
+    const subtype = getRgsSubtype(detailEnvelope, d);
     const isMcsm = subtype.includes("mcsm");
+    const isK8sPanel = subtype.includes("k8s_panel");
+    const isKvm = subtype.includes("kvm") || (!isMcsm && !isK8sPanel);
     const eggType = d.EggType && typeof d.EggType === "object" ? d.EggType : {};
     const eggMeta = eggType.egg && typeof eggType.egg === "object" ? eggType.egg : {};
     const gameTitle = String(eggMeta.title || eggMeta.name || eggType.egg_name || d.EggTypeId || "-");
-    const accessHost = d.NatPublicDomain || d.NATSpareDomain || d.NatPublicIP || "-";
+    const accessHost = getRgsMcsmAccessHost(d);
     const natPorts = natList
       .map((x) => {
         const out = x && x.PortOut !== undefined ? String(x.PortOut) : "";
@@ -2123,12 +2259,29 @@ function buildDetailView(kind, id, detailData, monitorData) {
       : String(d.OsName || d.HostName || d.Name || "-");
     const gameExpireRaw = pickFirstFieldDeep(d, ["ExpDate", "exp_date", "expired_at", "expire_at", "end_time", "due_time"]);
     const gameExpireAt = formatDateTime(gameExpireRaw) || "-";
+    const ipModeLabel = getRgsIpModeLabel(detailEnvelope, d);
+    const serviceTypeLabel = getRgsServiceTypeLabel(subtype);
+    const chargeTypeLabel = getChargeTypeText(plan.charge_type || d.charge_type);
+    const panelUser = String(options.panelUser || d.McsmUserName || d.McsmUser?.name || "").trim();
+    const panelPassword = String(options.panelPassword || "").trim();
+    const osDetectText = `${String(d.OsName || "")} ${String(d.OsInfo?.name || "")} ${String(d.OsInfo?.chinese_name || "")}`.toLowerCase();
+    const isWindowsLike = String(d.OsInfo?.os_type || "").toLowerCase() === "windows" || osDetectText.includes("windows");
+    const remoteUserRaw = String(
+      pickFirstFieldDeep(d, ["UserName", "username", "user", "Account", "LoginUser", "RemoteUser", "SSHUser", "DefaultUser"]) || ""
+    ).trim();
+    const remoteUser = remoteUserRaw || (isWindowsLike ? "Administrator" : "root");
+    const remotePassword = String(
+      pickFirstFieldDeep(d, ["Password", "Passwd", "password", "passwd", "LoginPass", "DefaultPass", "RemotePassword", "SSHPassword", "DefaultPassword"]) || ""
+    ).trim();
     const baseInfo = [
       { key: "产品类型", value: "游戏云" },
       { key: "产品ID", value: String(id) },
       { key: "名称", value: displayName },
       { key: "状态", value: d.Status || "-" },
-      { key: "公网IP", value: isMcsm ? accessHost : showIp },
+      { key: "服务类型", value: serviceTypeLabel },
+      { key: "IP类型", value: ipModeLabel },
+      { key: "计费模式", value: chargeTypeLabel },
+      { key: isMcsm ? "接入地址" : "公网IP", value: isMcsm ? accessHost : showIp },
       { key: "配置", value: plan.chinese || plan.plan_name || d.PlanName || d.Spec || "-" },
       { key: "到期时间", value: gameExpireAt }
     ];
@@ -2136,56 +2289,52 @@ function buildDetailView(kind, id, detailData, monitorData) {
       { key: "CPU", value: `${String(d.CPU ?? plan.cpu ?? "-")} 核` },
       { key: "内存", value: `${String(d.Memory ?? plan.memory ?? "-")} GB` },
       { key: "系统盘", value: `${String(d.BaseDisk ?? d.Disk ?? plan.base_disk ?? plan.disk ?? "-")} GB` },
-      { key: "计费模式", value: getChargeTypeText(plan.charge_type || d.charge_type) },
-      { key: "电量", value: d.CpuPoint === undefined ? "-" : `${String(d.CpuPoint)} 点` },
       { key: "上行带宽", value: `${String(d.NetIn ?? plan.net_in ?? "-")} Mbps` },
-      { key: "下行带宽", value: `${String(d.NetOut ?? plan.net_out ?? "-")} Mbps` },
-      { key: "备份数量", value: `${String(counts.rbs)} 个` },
-      { key: "数据盘", value: `${String(counts.eDisk)} 个` },
-      { key: "IP数量", value: `${String(counts.ipCount)} 个` },
-      { key: "私有网络", value: `${String(counts.vnetCount)} 个` }
+      { key: "下行带宽", value: `${String(d.NetOut ?? plan.net_out ?? "-")} Mbps` }
     ];
     const configRows = isMcsm
       ? [
           ...commonRows,
-          { key: "接入地址", value: accessHost },
           { key: "开放端口", value: natPorts || "-" },
           { key: "游戏类型", value: String(gameTitle) },
           { key: "运行镜像", value: String(eggType.mcsm_docker || eggType.docker || "-") },
-          { key: "面板账号", value: String(d.McsmUserName || d.McsmUser?.name || "-") },
           { key: "实例UUID", value: String(d.ServerUUID || d.DaemonUUID || "-") }
         ]
       : [
           ...commonRows,
-          { key: "系统", value: d.OsInfo?.chinese_name || d.OsName || "-" }
+          { key: "系统", value: d.OsInfo?.chinese_name || d.OsName || "-" },
+          { key: "电量", value: d.CpuPoint === undefined ? "-" : `${String(d.CpuPoint)} 点` }
         ];
     const memoryPercent = usage.FreeMem !== undefined && usage.MaxMem !== undefined && Number(usage.MaxMem) > 0
       ? (Math.max(0, Number(usage.MaxMem) - Number(usage.FreeMem)) / Number(usage.MaxMem)) * 100
       : (usage.memory_used !== undefined && usage.memory_total !== undefined && Number(usage.memory_total) > 0
         ? (Number(usage.memory_used) / Number(usage.memory_total)) * 100
         : null);
-    const monitorRows = [
-      { key: "CPU(%)", value: usage.CPU === undefined ? "-" : Number(usage.CPU).toFixed(2) },
-      {
-        key: "内存使用",
-        percent: memoryPercent,
-        value: usage.FreeMem !== undefined && usage.MaxMem !== undefined
-          ? `${formatBytes(Math.max(0, usage.MaxMem - usage.FreeMem))}`
-          : (usage.memory_used !== undefined && usage.memory_total !== undefined
-            ? `${formatBytes(usage.memory_used)}`
-            : "-")
-      },
-      { key: "磁盘读速率", value: usage.DiskRead === undefined ? "-" : formatRate(usage.DiskRead) },
-      { key: "磁盘写速率", value: usage.DiskWrite === undefined ? "-" : formatRate(usage.DiskWrite) },
-      { key: "上行速率", value: usage.NetOut === undefined ? "-" : formatRate(usage.NetOut) },
-      { key: "下行速率", value: usage.NetIn === undefined ? "-" : formatRate(usage.NetIn) }
-    ];
+    const monitorRows = isMcsm
+      ? []
+      : [
+          { key: "CPU(%)", value: usage.CPU === undefined ? "-" : Number(usage.CPU).toFixed(2) },
+          {
+            key: "内存使用",
+            percent: memoryPercent,
+            value: usage.FreeMem !== undefined && usage.MaxMem !== undefined
+              ? `${formatBytes(Math.max(0, usage.MaxMem - usage.FreeMem))}`
+              : (usage.memory_used !== undefined && usage.memory_total !== undefined
+                ? `${formatBytes(usage.memory_used)}`
+                : "-")
+          },
+          { key: "磁盘读速率", value: usage.DiskRead === undefined ? "-" : formatRate(usage.DiskRead) },
+          { key: "磁盘写速率", value: usage.DiskWrite === undefined ? "-" : formatRate(usage.DiskWrite) },
+          { key: "上行速率", value: usage.NetOut === undefined ? "-" : formatRate(usage.NetOut) },
+          { key: "下行速率", value: usage.NetIn === undefined ? "-" : formatRate(usage.NetIn) }
+        ];
 
     const chargeType = String(plan.charge_type || d.charge_type || "").toLowerCase();
     const hasTrafficBase = Number(plan.traffic_base_gb || d.traffic_base_gb || 0) > 0;
     const hasTrafficPrice = !!((plan.traffic_price || d.traffic_price) && typeof (plan.traffic_price || d.traffic_price) === "object" && Object.keys(plan.traffic_price || d.traffic_price).length);
     const isTrafficMetered = chargeType.includes("traffic") || hasTrafficBase || hasTrafficPrice;
     const trafficBytes = d.TrafficBytes ?? d.traffic_bytes ?? d.TrafficLeft ?? d.traffic_left;
+    const mcsmPanelUrl = isMcsm ? buildRgsMcsmPanelUrl(detailEnvelope, d, panelUser, panelPassword) : "";
     const serverInfo = {
       id: String(d.ID || id),
       tag: d.Tag && String(d.Tag).trim() ? String(d.Tag) : "未设定",
@@ -2194,11 +2343,22 @@ function buildDetailView(kind, id, detailData, monitorData) {
       expireAt: gameExpireAt,
       os: d.OsInfo?.chinese_name || d.OsInfo?.english_name || d.OsName || "",
       osType: d.OsInfo?.os_type || "",
+      controlKind: "rgs",
+      serviceType: serviceTypeLabel,
+      serviceSubtype: subtype,
+      chargeType: chargeTypeLabel,
+      ipMode: ipModeLabel,
+      isKvm,
+      isMcsm,
+      isK8sPanel,
+      addressLabel: isMcsm ? "管理面板" : "公网 IP 地址",
+      userLabel: isMcsm ? "面板用户名" : "远程用户名",
+      passwordLabel: isMcsm ? "面板密码" : "远程密码",
       remoteIp: isMcsm ? String(accessHost || "") : (showIp === "-" ? "" : String(showIp)),
-      remoteUser: String(pickFirstFieldDeep(d, ["McsmUserName", "UserName", "username", "user", "Account", "LoginUser"]) || "").trim(),
-      remotePassword: String(pickFirstFieldDeep(d, ["McsmPasswd", "Password", "Passwd", "password", "passwd", "LoginPass", "DefaultPass"]) || "").trim(),
-      panelUrl: "",
-      panelEnabled: false,
+      remoteUser: isMcsm ? panelUser : remoteUser,
+      remotePassword: isMcsm ? panelPassword : remotePassword,
+      panelUrl: mcsmPanelUrl,
+      panelEnabled: Boolean(mcsmPanelUrl),
       showTraffic: isTrafficMetered,
       trafficLeft: trafficBytes !== undefined ? formatBytes(trafficBytes) : "-"
     };
@@ -2252,11 +2412,8 @@ function buildDetailView(kind, id, detailData, monitorData) {
     ];
 
     const configRows = [
-      { key: "域名", value: String(domainName) },
-      { key: "DNS", value: String(dnsProvider) },
       { key: "NS", value: formatDisplayValue(nsValue) || "-" },
       { key: "注册时间", value: regDate || "-" },
-      { key: "到期时间", value: domainExpireAt || "-" },
       { key: "到期提醒", value: yesNo(expireNoticeRaw) },
       { key: "域名锁", value: yesNo(lockRaw) },
       { key: "备案号", value: icpRaw ? String(icpRaw) : "-" }
@@ -2862,7 +3019,7 @@ const ProductListPage = {
               </div>
               <div class="detail-card-sub">{{ getCardMeta(id).nodeText }}</div>
               <div class="detail-card-kv">
-                <span>IP：{{ showIp ? getCardMeta(id).ipText : '已隐藏' }}</span>
+                <span>{{ getCardMeta(id).addressLabel }}：{{ showIp ? getCardMeta(id).addressText : '已隐藏' }}</span>
                 <span>到期：{{ getCardMeta(id).expireText }}</span>
               </div>
               <div class="detail-card-bars" v-if="getCardMeta(id).showMetrics">
@@ -2978,18 +3135,7 @@ const ProductListPage = {
       });
       return ok ? ip : "";
     };
-    const pickCardIp = (detailData, fallback) => {
-      const direct = pickFirstFieldDeep(detailData, [
-        "MainIPv4", "main_ipv4", "NatPublicIP", "nat_public_ip", "PublicIPv4", "public_ipv4",
-        "PublicIP", "public_ip", "MainIP", "main_ip", "IP", "ip"
-      ]);
-      const ipv4FromDirect = parseIPv4(direct);
-      if (ipv4FromDirect) return ipv4FromDirect;
-      const ipv4FromFallback = parseIPv4(fallback);
-      if (ipv4FromFallback) return ipv4FromFallback;
-      return String(fallback || "-");
-    };
-    const formatCardIp = (raw) => {
+    const formatCardAddress = (raw) => {
       const s = String(raw || "").trim();
       if (!s || s === "-") return "-";
       if (s.includes(":") && s.length > 18) {
@@ -3012,11 +3158,16 @@ const ProductListPage = {
       const memText = memRow ? String(memRow.value || "") : "-";
       const cpuPercent = parsePercentText(cpuText) ?? 0;
       const memPercent = toNumberOrNull(memRow?.percent) ?? parseMemPercent(memText) ?? 0;
+      const detailRoot = detailData && detailData.Data && typeof detailData.Data === "object" ? detailData.Data : detailData;
+      const isMcsm = Boolean(info.isMcsm);
+      const directAddress = isMcsm ? getRgsMcsmAccessHost(detailRoot) : pickRgsKvmAddress(detailData, detailRoot);
+      const fallbackAddress = String(info.remoteIp || "-");
       return {
         statusText: status.statusText,
         statusClass: status.statusClass,
         nodeText: String(info.node || "-"),
-        ipText: formatCardIp(pickCardIp(detailData, String(info.remoteIp || "-"))),
+        addressLabel: isMcsm ? "接入" : "IP",
+        addressText: formatCardAddress(directAddress && directAddress !== "-" ? directAddress : fallbackAddress),
         expireText: parseExpireBrief(String(info.expireAt || "-")),
         cpuText,
         memText,
@@ -3037,7 +3188,8 @@ const ProductListPage = {
         statusText: "加载中",
         statusClass: "unknown",
         nodeText: kindLabel.value,
-        ipText: "-",
+        addressLabel: "IP",
+        addressText: "-",
         expireText: "-",
         cpuText: "-",
         memText: "-",
@@ -3273,26 +3425,29 @@ const ProductDetailPage = {
                   <i :class="statusView.icon"></i>{{ statusView.label }}
                 </b>
               </div>
+              <div v-if="kind === 'rgs' && serverInfo.serviceType" class="server-row"><span>服务类型</span><b>{{ serverInfo.serviceType }}</b></div>
+              <div v-if="kind === 'rgs' && serverInfo.chargeType" class="server-row"><span>计费模式</span><b>{{ serverInfo.chargeType }}</b></div>
+              <div v-if="kind === 'rgs' && serverInfo.ipMode" class="server-row"><span>IP类型</span><b>{{ serverInfo.ipMode }}</b></div>
               <div class="server-row"><span>{{ kind === 'rca' ? '区域' : '节点' }}</span><b>{{ serverInfo.node }}</b></div>
               <div class="server-row"><span>到期日期</span><b>{{ serverInfo.expireAt }}</b></div>
               <div class="server-row" v-if="serverInfo.showTraffic"><span>剩余流量</span><b>{{ serverInfo.trafficLeft }}</b></div>
-              <div v-if="canOperatePower" class="remote-info-block">
-                <div class="server-row server-row-remote">
-                  <span>公网 IP 地址</span>
+              <div v-if="showRemoteInfoBlock" :class="['remote-info-block', { 'is-panel-remote-block': kind === 'rgs' && serverInfo.isMcsm }]">
+                <div :class="['server-row', 'server-row-remote', { 'server-row-half': kind === 'rgs' && serverInfo.isMcsm }]">
+                  <span>{{ serverInfo.addressLabel || '公网 IP 地址' }}</span>
                   <div class="remote-cell">
                     <b>{{ serverInfo.remoteIp || '-' }}</b>
                     <button class="remote-action-btn" @click="copyRemoteIp">复制</button>
                   </div>
                 </div>
-                <div class="server-row server-row-remote">
-                  <span>远程用户名</span>
+                <div :class="['server-row', 'server-row-remote', { 'server-row-half': kind === 'rgs' && serverInfo.isMcsm }]">
+                  <span>{{ serverInfo.userLabel || '远程用户名' }}</span>
                   <div class="remote-cell">
                     <b>{{ serverInfo.remoteUser || '-' }}</b>
                     <button class="remote-action-btn" @click="copyRemoteUser">复制</button>
                   </div>
                 </div>
-                <div class="server-row server-row-remote">
-                  <span>远程密码</span>
+                <div :class="['server-row', 'server-row-remote', { 'server-row-wide': kind === 'rgs' && serverInfo.isMcsm }]">
+                  <span>{{ serverInfo.passwordLabel || '远程密码' }}</span>
                   <div class="remote-cell">
                     <b>{{ remotePasswordText }}</b>
                     <button class="remote-action-btn" @click="copyRemotePassword">复制</button>
@@ -3301,19 +3456,20 @@ const ProductDetailPage = {
                 </div>
               </div>
             </div>
-            <div v-if="canOperatePower" class="detail-quick-actions">
+            <div v-if="showQuickActionsPanel" class="detail-quick-actions">
               <div class="panel-title mini">
                 <a-typography-title :heading="6" class="typo-title">快速操作</a-typography-title>
-                <a-typography-text class="panel-subtext" type="secondary">服务器控制与远程连接</a-typography-text>
+                <a-typography-text class="panel-subtext" type="secondary">{{ quickActionHint }}</a-typography-text>
               </div>
               <div class="action-grid quick-actions-grid">
                 <a-button class="line-btn op-neutral" size="medium" type="outline" @click="copyProductId">复制ID</a-button>
-                <a-button class="line-btn op-start" size="medium" type="outline" @click="startServer">开机</a-button>
-                <a-button class="line-btn op-reboot" size="medium" type="outline" @click="rebootServer">重启</a-button>
-                <a-button class="line-btn op-stop" size="medium" type="outline" @click="stopServer">关机</a-button>
+                <a-button v-if="canOperatePower" class="line-btn op-start" size="medium" type="outline" @click="startServer">开机</a-button>
+                <a-button v-if="canOperatePower" class="line-btn op-reboot" size="medium" type="outline" @click="rebootServer">重启</a-button>
+                <a-button v-if="canOperatePower" class="line-btn op-stop" size="medium" type="outline" @click="stopServer">关机</a-button>
                 <a-button v-if="showBtPanelButton" class="line-btn op-panel" size="medium" type="outline" @click="openBtPanel">宝塔面板</a-button>
+                <a-button v-if="showMcsmPanelButton" class="line-btn op-panel" size="medium" type="outline" @click="openMcsmPanel">进入 MCSM</a-button>
                 <a-button v-if="showXtermButton" class="line-btn op-console" size="medium" type="outline" :disabled="vncLoading" @click="openVnc('xtermjs')">Xtermjs</a-button>
-                <a-button class="line-btn op-console" size="medium" type="outline" :disabled="vncLoading" @click="openVnc('novnc')">NoVNC</a-button>
+                <a-button v-if="showNoVncButton" class="line-btn op-console" size="medium" type="outline" :disabled="vncLoading" @click="openVnc('novnc')">NoVNC</a-button>
               </div>
               <div v-if="vncLoading" class="vnc-loading-tip">正在获取 VNC 地址...</div>
               <div v-if="opLoading" class="vnc-loading-tip">正在执行操作...</div>
@@ -3338,7 +3494,7 @@ const ProductDetailPage = {
             </div>
           </section>
 
-          <section class="panel detail-monitor-panel" v-if="monitorPath">
+          <section class="panel detail-monitor-panel" v-if="showMonitorPanel">
             <div class="panel-title">
               <a-typography-title :heading="6" class="typo-title">监控信息</a-typography-title>
             </div>
@@ -3397,6 +3553,9 @@ const ProductDetailPage = {
       expireAt: "-",
       os: "",
       osType: "",
+      addressLabel: "公网 IP 地址",
+      userLabel: "远程用户名",
+      passwordLabel: "远程密码",
       remoteIp: "",
       remoteUser: "",
       remotePassword: "",
@@ -3437,7 +3596,21 @@ const ProductDetailPage = {
     const monitorRetryDisabledUntil = ref(0);
     const remotePasswordVisible = ref(false);
     let detailAutoRefreshTimer = null;
-    const canOperatePower = computed(() => kind.value === "rcs" || kind.value === "rgpu");
+    const isRgsPowerEnabled = computed(() => {
+      if (kind.value !== "rgs") return false;
+      const subtype = String(serverInfo.value.serviceSubtype || "").toLowerCase();
+      if (!subtype) return false;
+      return subtype.includes("kvm");
+    });
+    const canOperatePower = computed(() => kind.value === "rcs" || kind.value === "rgpu" || isRgsPowerEnabled.value);
+    const showRemoteInfoBlock = computed(() => {
+      if (kind.value === "rgs") return Boolean(serverInfo.value.isKvm || serverInfo.value.isMcsm);
+      return canOperatePower.value;
+    });
+    const showMonitorPanel = computed(() => {
+      if (kind.value === "rgs" && serverInfo.value.isMcsm) return false;
+      return Boolean(monitorRows.value.length || monitorPath.value);
+    });
     const isWindowsServer = computed(() => {
       const osType = String(serverInfo.value.osType || "").toLowerCase();
       if (osType === "windows") return true;
@@ -3445,8 +3618,30 @@ const ProductDetailPage = {
       if (!osText) return false;
       return osText.includes("windows") || osText.includes("win server") || osText.includes("win10") || osText.includes("win11") || osText.includes("win201");
     });
-    const showXtermButton = computed(() => canOperatePower.value && !isWindowsServer.value);
+    const showXtermButton = computed(() => {
+      if (!canOperatePower.value || isWindowsServer.value) return false;
+      if (kind.value === "rgs") return Boolean(serverInfo.value.isKvm);
+      return true;
+    });
+    const showNoVncButton = computed(() => {
+      if (!canOperatePower.value) return false;
+      if (kind.value === "rgs") return Boolean(serverInfo.value.isKvm);
+      return true;
+    });
     const showBtPanelButton = computed(() => canOperatePower.value && Boolean(serverInfo.value.panelEnabled && serverInfo.value.panelUrl));
+    const showMcsmPanelButton = computed(() => kind.value === "rgs" && Boolean(serverInfo.value.isMcsm && serverInfo.value.panelEnabled && serverInfo.value.panelUrl));
+    const showQuickActionsPanel = computed(() => Boolean(
+      canOperatePower.value
+      || showBtPanelButton.value
+      || showMcsmPanelButton.value
+      || showXtermButton.value
+      || showNoVncButton.value
+    ));
+    const quickActionHint = computed(() => (
+      showMcsmPanelButton.value && !canOperatePower.value
+        ? "面板直达与基础快捷操作"
+        : "服务器控制与远程连接"
+    ));
     const autoRefreshText = computed(() => {
       const base = `自动更新：每 ${Math.floor(DETAIL_AUTO_REFRESH_MS / 1000)} 秒`;
       if (!autoRefreshAt.value) return base;
@@ -3485,21 +3680,21 @@ const ProductDetailPage = {
     }
 
     async function copyRemoteIp() {
-      await copyWithFallback("公网IP", serverInfo.value.remoteIp);
+      await copyWithFallback(serverInfo.value.addressLabel || "公网IP", serverInfo.value.remoteIp);
     }
 
     async function copyRemoteUser() {
-      await copyWithFallback("远程用户名", serverInfo.value.remoteUser);
+      await copyWithFallback(serverInfo.value.userLabel || "远程用户名", serverInfo.value.remoteUser);
     }
 
     async function copyRemotePassword() {
-      await copyWithFallback("远程密码", serverInfo.value.remotePassword);
+      await copyWithFallback(serverInfo.value.passwordLabel || "远程密码", serverInfo.value.remotePassword);
     }
 
     function toggleRemotePassword() {
       const raw = String(serverInfo.value.remotePassword || "").trim();
       if (!raw) {
-        toast("暂无远程密码信息");
+        toast(`暂无${serverInfo.value.passwordLabel || "远程密码"}信息`);
         return;
       }
       remotePasswordVisible.value = !remotePasswordVisible.value;
@@ -3685,7 +3880,7 @@ const ProductDetailPage = {
         errorText.value = "";
         opErrorText.value = "";
         baseInfo.value = [];
-        serverInfo.value = { id: "-", tag: "未设定", status: "-", node: "-", expireAt: "-", os: "", osType: "", remoteIp: "", remoteUser: "", remotePassword: "", panelUrl: "", panelEnabled: false, showTraffic: false, trafficLeft: "-" };
+        serverInfo.value = { id: "-", tag: "未设定", status: "-", node: "-", expireAt: "-", os: "", osType: "", controlKind: "", serviceType: "", serviceSubtype: "", chargeType: "", ipMode: "", isKvm: false, isMcsm: false, isK8sPanel: false, addressLabel: "公网 IP 地址", userLabel: "远程用户名", passwordLabel: "远程密码", remoteIp: "", remoteUser: "", remotePassword: "", panelUrl: "", panelEnabled: false, showTraffic: false, trafficLeft: "-" };
         remotePasswordVisible.value = false;
         configRows.value = [];
         monitorRows.value = [];
@@ -3716,8 +3911,21 @@ const ProductDetailPage = {
           }
           if (!detailOk) throw new Error("详情接口请求失败");
         }
+        const detailRoot = detailData && detailData.Data && typeof detailData.Data === "object" ? detailData.Data : detailData;
+        const isMcsmRgs = kind.value === "rgs" && getRgsSubtype(detailData, detailRoot).includes("mcsm");
+        const hasInlineRgsUsage = kind.value === "rgs"
+          && detailRoot
+          && typeof detailRoot === "object"
+          && detailRoot.UsageData
+          && typeof detailRoot.UsageData === "object"
+          && Object.keys(detailRoot.UsageData).length > 0;
+        if (isMcsmRgs || hasInlineRgsUsage) {
+          monitorPath.value = "";
+          monitorResolvedPath.value = "";
+          monitorRetryDisabledUntil.value = 0;
+        }
         let monitorData = {};
-        if (endpoint.monitor) {
+        if (endpoint.monitor && !isMcsmRgs && !hasInlineRgsUsage) {
           try {
             const now = Date.now();
             const fallbackPaths = [
@@ -3759,7 +3967,10 @@ const ProductDetailPage = {
             reportLog("WARN", "monitor_api_error", { kind: kind.value, id: id.value, error: String(e) });
           }
         }
-        const view = buildDetailView(kind.value, id.value, detailData, monitorData);
+        const panelCreds = isMcsmRgs
+          ? await resolveRgsMcsmPanelCredentials(detailData, force)
+          : { panelUser: "", panelPassword: "" };
+        const view = buildDetailView(kind.value, id.value, detailData, monitorData, panelCreds);
         baseInfo.value = view.baseInfo;
         if (view.serverInfo) serverInfo.value = view.serverInfo;
         remotePasswordVisible.value = false;
@@ -3873,13 +4084,28 @@ const ProductDetailPage = {
       window.open(url, "_blank");
     }
 
+    async function openMcsmPanel() {
+      const url = String(serverInfo.value.panelUrl || "").trim();
+      if (!url) {
+        toast("未检测到可用的 MCSM 面板地址");
+        return;
+      }
+      const ok = await appConfirm(
+        "将带上当前面板账号信息直达 MCSM 控制台。\n若浏览器拦截新窗口，请允许弹窗后重试。",
+        { title: "打开 MCSM 面板", confirmText: "继续打开", cancelText: "取消" }
+      );
+      if (!ok) return;
+      window.open(url, "_blank");
+    }
+
     function controlPath(action) {
       const productId = String(id.value || "").trim();
       if (!productId) return "";
       if (!canOperatePower.value) return "";
-      if (action === "start") return `/product/rcs/${productId}/start`;
-      if (action === "reboot") return `/product/rcs/${productId}/reboot`;
-      if (action === "stop") return `/product/rcs/${productId}/stop`;
+      const controlKind = kind.value === "rgpu" ? "rcs" : kind.value;
+      if (action === "start") return `/product/${controlKind}/${productId}/start`;
+      if (action === "reboot") return `/product/${controlKind}/${productId}/reboot`;
+      if (action === "stop") return `/product/${controlKind}/${productId}/stop`;
       return "";
     }
 
@@ -3946,7 +4172,8 @@ const ProductDetailPage = {
         return;
       }
       const safeMode = mode === "novnc" ? "novnc" : "xtermjs";
-      const path = `/product/rcs/${productId}/vnc?console_type=${encodeURIComponent(safeMode)}`;
+      const vncKind = kind.value === "rgpu" ? "rcs" : kind.value;
+      const path = `/product/${vncKind}/${productId}/vnc?console_type=${encodeURIComponent(safeMode)}`;
       vncLoading.value = true;
       opApiPath.value = path;
       opErrorText.value = "";
@@ -4106,6 +4333,10 @@ const ProductDetailPage = {
       loadDetail,
       goList,
       canOperatePower,
+      showRemoteInfoBlock,
+      showMonitorPanel,
+      showQuickActionsPanel,
+      quickActionHint,
       copyProductId,
       copyRemoteIp,
       copyRemoteUser,
@@ -4119,6 +4350,7 @@ const ProductDetailPage = {
       openVnc,
       closeVnc,
       openBtPanel,
+      openMcsmPanel,
       vncShow,
       vncLoading,
       vncUrl,
@@ -4128,7 +4360,9 @@ const ProductDetailPage = {
       opApiPath,
       autoRefreshText,
       showBtPanelButton,
+      showMcsmPanelButton,
       showXtermButton,
+      showNoVncButton,
       onVncEnter,
       onVncLeave
     };

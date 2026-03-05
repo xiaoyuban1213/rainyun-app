@@ -1,11 +1,18 @@
 {
-  "version": "1.1.6",
-  "downloadUrl": "http://ros.yuban.cloud/app/RainYun-App-v1.1.6-release.apk",
-  "notes": "1. 工程化动效改造：新增 safeAnimate/safeAnimateAll + 动画取消注册表，避免动画叠加与空节点报错。\n2. 页面/弹窗/卡片动效统一：页面切换、弹窗开关、卡片入场与点击反馈节奏优化，动画感知更自然。\n3. VNC/noVNC 性能优化：打开时禁用 blur，入场后延迟挂载重内容，关闭时先卸载再退场，降低掉帧。\n4. 每日收益分析弹窗修复：恢复弹窗内容区纵向滚动，解决“下滑不了”的问题。\n5. 数字滚动策略收敛：仅保留核心 KPI 滚动，减少非关键数值抖动与重绘开销。\n6. 签名变更说明：本版本使用新版签名，需先卸载已安装旧版本后再重新安装。",
-  "sha256": "74BEB4B691ABA0C68DE3D4D4EA1E873DB300C35D5BBB947D52A6683AE48FC801",
-  "buildTime": "2026-03-05T16:28:13+08:00",
+  "version": "1.1.7",
+  "downloadUrl": "http://ros.yuban.cloud/app/RainYun-App-v1.1.7-release.apk",
+  "notes": "1. 基本实现游戏云（RGS）的实际操作，暂不支持雨云面板。\n2. 优化了详情页布局。",
+  "sha256": "561DACFC0D26B0864CD03A6EDB4FDADB8B6ABA9D36B3199A98A9747EBCE2B358",
+  "buildTime": "2026-03-06T07:21:17+08:00",
   "force": false,
   "history": [
+    {
+      "version": "1.1.7",
+      "notes": "1. 基本实现游戏云（RGS）的实际操作，暂不支持雨云面板。\n2. 优化了详情页布局。",
+      "buildTime": "2026-03-06T07:21:17+08:00",
+      "downloadUrl": "http://ros.yuban.cloud/app/RainYun-App-v1.1.7-release.apk",
+      "sha256": "561DACFC0D26B0864CD03A6EDB4FDADB8B6ABA9D36B3199A98A9747EBCE2B358"
+    },
     {
       "version": "1.1.6",
       "notes": "1. 工程化动效改造：新增 safeAnimate/safeAnimateAll + 动画取消注册表，避免动画叠加与空节点报错。\n2. 页面/弹窗/卡片动效统一：页面切换、弹窗开关、卡片入场与点击反馈节奏优化，动画感知更自然。\n3. VNC/noVNC 性能优化：打开时禁用 blur，入场后延迟挂载重内容，关闭时先卸载再退场，降低掉帧。\n4. 每日收益分析弹窗修复：恢复弹窗内容区纵向滚动，解决“下滑不了”的问题。\n5. 数字滚动策略收敛：仅保留核心 KPI 滚动，减少非关键数值抖动与重绘开销。\n6. 签名变更说明：本版本使用新版签名，需先卸载已安装旧版本后再重新安装。",
