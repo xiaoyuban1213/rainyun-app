@@ -1334,12 +1334,18 @@ html[data-motion-paused="1"] .promo-report-row {
 .promo-report-modal {
   width: min(380px, 100%);
   max-height: min(82vh, 680px);
-  overflow: auto;
   background: linear-gradient(165deg, var(--surface-0), var(--surface-2));
   border: 1px solid var(--line);
   border-radius: 16px;
   box-shadow: 0 16px 40px rgba(39, 68, 106, 0.22);
   padding: 14px;
+}
+.promo-report-modal.app-dialog {
+  overflow-y: auto;
+  overflow-x: hidden;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+  touch-action: pan-y;
 }
 .promo-report-head {
   display: flex;
