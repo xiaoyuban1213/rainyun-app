@@ -865,6 +865,101 @@ function prefersReducedMotionGlobal() {
   return Boolean(window.matchMedia("(prefers-reduced-motion: reduce)").matches);
 }
 
+const motionCancelRegistry = new WeakMap();
+const motionActiveEntries = new Set();
+const motionRuntime = reactive({
+  nonCriticalPaused: false
+});
+
+function motionNoopControl() {
+  return {
+    finished: Promise.resolve(),
+    cancel: () => { /* noop */ }
+  };
+}
+
+function cancelMotionFor(target) {
+  if (!target || !(target instanceof Element)) return;
+  const prev = motionCancelRegistry.get(target);
+  if (!prev || typeof prev.cancel !== "function") return;
+  try { prev.cancel(); } catch { /* ignore */ }
+}
+
+function cancelNonCriticalMotions() {
+  motionActiveEntries.forEach((entry) => {
+    if (!entry?.nonCritical) return;
+    if (entry?.control && typeof entry.control.cancel === "function") {
+      try { entry.control.cancel(); } catch { /* ignore */ }
+    }
+  });
+}
+
+function setNonCriticalMotionPaused(paused) {
+  const next = Boolean(paused);
+  if (motionRuntime.nonCriticalPaused === next) return;
+  motionRuntime.nonCriticalPaused = next;
+  if (typeof document !== "undefined") {
+    document.documentElement.setAttribute("data-motion-paused", next ? "1" : "0");
+  }
+  if (next) cancelNonCriticalMotions();
+}
+
+function safeAnimate(target, keyframes, options = {}, meta = {}) {
+  const element = target instanceof Element ? target : null;
+  if (!element) return motionNoopControl();
+  if (!meta.critical && motionRuntime.nonCriticalPaused) return motionNoopControl();
+  cancelMotionFor(element);
+  try {
+    const control = animate(element, keyframes, options);
+    motionCancelRegistry.set(element, control);
+    const entry = { element, control, nonCritical: !meta.critical };
+    motionActiveEntries.add(entry);
+    Promise.resolve(control.finished).finally(() => {
+      motionActiveEntries.delete(entry);
+      if (motionCancelRegistry.get(element) === control) {
+        motionCancelRegistry.delete(element);
+      }
+    });
+    return control;
+  } catch {
+    return motionNoopControl();
+  }
+}
+
+function safeAnimateAll(targets, keyframes, options = {}, meta = {}) {
+  const list = Array.isArray(targets)
+    ? targets
+    : (targets && typeof targets.length === "number" ? Array.from(targets) : []);
+  const controls = [];
+  const baseDelay = Number.isFinite(Number(options.delay)) ? Number(options.delay) : 0;
+  const staggerDelay = Number.isFinite(Number(options.stagger)) ? Number(options.stagger) : 0;
+  list.forEach((node, idx) => {
+    if (!(node instanceof Element)) return;
+    const c = safeAnimate(
+      node,
+      keyframes,
+      { ...options, stagger: undefined, delay: baseDelay + (staggerDelay * idx) },
+      meta
+    );
+    controls.push(c);
+  });
+  return {
+    controls,
+    cancel: () => controls.forEach((c) => {
+      if (c && typeof c.cancel === "function") {
+        try { c.cancel(); } catch { /* ignore */ }
+      }
+    }),
+    finished: Promise.all(controls.map((c) => Promise.resolve(c.finished))).then(() => undefined)
+  };
+}
+
+async function afterNextPaint() {
+  await nextTick();
+  if (typeof requestAnimationFrame !== "function") return;
+  await new Promise((resolve) => requestAnimationFrame(() => resolve()));
+}
+
 function toAnimNumber(v) {
   if (v === null || v === undefined || v === "") return null;
   const n = Number(v);
@@ -2495,13 +2590,13 @@ const HomePage = {
       pickFirstFieldDeep(rawData.value, ["Money", "balance", "money", "amount", "wallet", "credit", "user_money", "cash"])
     ) ?? 0);
 
-    const points = useAnimatedNumber(pointsRaw, (n) => (n === null ? "-" : formatCount(n)), { duration: 0.45 });
-    const monthCost = useAnimatedNumber(monthCostRaw, (n) => (n === null ? "-" : formatMoney(n)), { duration: 0.42 });
-    const balance = useAnimatedNumber(balanceRaw, (n) => (n === null ? "-" : formatMoney(n)), { duration: 0.42 });
-    const productTotal = useAnimatedNumber(productTotalRaw, (n) => (n === null ? "-" : formatCount(n)), { duration: 0.35 });
-    const tickets = useAnimatedNumber(ticketsRaw, (n) => (n === null ? "-" : formatCount(n)), { duration: 0.32 });
-    const renew = useAnimatedNumber(renewRaw, (n) => (n === null ? "-" : formatCount(n)), { duration: 0.32 });
-    const coupons = useAnimatedNumber(couponsRaw, (n) => (n === null ? "-" : formatCount(n)), { duration: 0.32 });
+    const points = useAnimatedNumber(pointsRaw, (n) => (n === null ? "-" : formatCount(n)), { duration: 0.38 });
+    const balance = useAnimatedNumber(balanceRaw, (n) => (n === null ? "-" : formatMoney(n)), { duration: 0.4 });
+    const renew = useAnimatedNumber(renewRaw, (n) => (n === null ? "-" : formatCount(n)), { duration: 0.34 });
+    const monthCost = computed(() => formatMoney(monthCostRaw.value));
+    const productTotal = computed(() => formatCount(productTotalRaw.value));
+    const tickets = computed(() => formatCount(ticketsRaw.value));
+    const coupons = computed(() => formatCount(couponsRaw.value));
 
     const goList = (kind) => router.push(`/product/${kind}`);
     const openEntry = (item) => {
@@ -2956,33 +3051,48 @@ const ProductListPage = {
       };
     };
     const animateListCards = async (force = false) => {
-      await nextTick();
+      await afterNextPaint();
       const root = listCardsRef.value;
       if (!root || prefersReducedMotionGlobal()) return;
       const nodes = Array.from(root.querySelectorAll(".id-card"));
+      const staged = nodes.slice(0, 8);
+      safeAnimateAll(
+        staged,
+        [
+          { opacity: 0.001, transform: "translate3d(0, 18px, 0) scale(0.975)" },
+          { opacity: 1, transform: "translate3d(0, 0, 0) scale(1)" }
+        ],
+        {
+          duration: 0.32,
+          stagger: 0.028,
+          easing: "cubic-bezier(.22,1,.36,1)"
+        },
+        { critical: false }
+      );
       nodes.slice(0, 24).forEach((node, idx) => {
         if (!node) return;
         if (!force && node.dataset.motionInited === "1") return;
         node.dataset.motionInited = "1";
         node.style.willChange = "transform, opacity";
-        animate(
+        safeAnimate(
           node,
           [
             { opacity: 0.001, transform: "translate3d(0, 18px, 0) scale(0.975)" },
             { opacity: 1, transform: "translate3d(0, 0, 0) scale(1)" }
           ],
           {
-            duration: 0.42,
+            duration: 0.34,
             delay: Math.min(idx * 0.028, 0.34),
             easing: "cubic-bezier(.22,1,.36,1)"
-          }
+          },
+          { critical: false }
         ).finished.finally(() => {
           node.style.willChange = "";
         });
       });
     };
     const animateCardMetaReady = async (id) => {
-      await nextTick();
+      await afterNextPaint();
       const root = listCardsRef.value;
       if (!root || prefersReducedMotionGlobal()) return;
       const node = root.querySelector(`.id-card[data-card-id="${String(id)}"]`);
@@ -2992,13 +3102,14 @@ const ProductListPage = {
       if (nowTs - lastTs < 1200) return;
       node.dataset.metaMotionTs = String(nowTs);
       node.style.willChange = "transform, opacity";
-      animate(
+      safeAnimate(
         node,
         [
           { opacity: 0.58, transform: "translate3d(0, 9px, 0) scale(0.987)" },
           { opacity: 1, transform: "translate3d(0, 0, 0) scale(1)" }
         ],
-        { duration: 0.34, easing: "cubic-bezier(.22,1,.36,1)" }
+        { duration: 0.24, easing: "cubic-bezier(.22,1,.36,1)" },
+        { critical: false }
       ).finished.finally(() => {
         node.style.willChange = "";
       });
@@ -3253,18 +3364,20 @@ const ProductDetailPage = {
         <a-typography-text class="panel-subtext detail-auto-refresh-text" type="secondary">{{ autoRefreshText }}</a-typography-text>
       </section>
 
-      <div v-if="vncShow" class="vnc-modal-mask" @click.self="closeVnc">
-        <div class="vnc-modal">
-          <div class="vnc-modal-head">
-            <b>VNC 远程连接</b>
-            <button class="vnc-close" @click="closeVnc">×</button>
-          </div>
-          <div class="vnc-modal-body">
-            <iframe v-if="vncUrl" :src="vncUrl" frameborder="0" allowfullscreen></iframe>
-            <a-typography-text v-else type="secondary" class="muted">正在建立连接...</a-typography-text>
+      <transition :css="false" @enter="onVncEnter" @leave="onVncLeave">
+        <div v-if="vncShow" class="vnc-modal-mask" @click.self="closeVnc">
+          <div class="vnc-modal">
+            <div class="vnc-modal-head">
+              <b>VNC 远程连接</b>
+              <button class="vnc-close" @click="closeVnc">×</button>
+            </div>
+            <div class="vnc-modal-body">
+              <iframe v-if="vncContentReady && vncUrl" :src="vncUrl" frameborder="0" allowfullscreen></iframe>
+              <a-typography-text v-else type="secondary" class="muted">正在建立连接...</a-typography-text>
+            </div>
           </div>
         </div>
-      </div>
+      </transition>
     </MobileShell>
   `,
   setup() {
@@ -3315,6 +3428,7 @@ const ProductDetailPage = {
     const vncShow = ref(false);
     const vncLoading = ref(false);
     const vncUrl = ref("");
+    const vncContentReady = ref(false);
     const autoRefreshAt = ref("");
     const detailRefreshing = ref(false);
     const autoRefreshRunning = ref(false);
@@ -3345,6 +3459,7 @@ const ProductDetailPage = {
       const size = Math.max(8, Math.min(20, raw.length));
       return "*".repeat(size);
     });
+    let vncMountTimer = null;
 
     async function copyWithFallback(label, text) {
       const v = String(text || "").trim();
@@ -3846,6 +3961,7 @@ const ProductDetailPage = {
         if (!targetUrl) {
           throw new Error("未获取到 VNC 地址");
         }
+        vncContentReady.value = false;
         vncUrl.value = toAbsoluteUrl(targetUrl, normalizeBaseUrl(store.auth.baseUrl));
         vncShow.value = true;
       } catch (e) {
@@ -3858,8 +3974,93 @@ const ProductDetailPage = {
     }
 
     function closeVnc() {
+      vncContentReady.value = false;
       vncShow.value = false;
       vncUrl.value = "";
+      setNonCriticalMotionPaused(false);
+    }
+
+    function scheduleVncContentMount() {
+      if (vncMountTimer) {
+        clearTimeout(vncMountTimer);
+        vncMountTimer = null;
+      }
+      const delayMs = prefersReducedMotionGlobal() ? 0 : 210;
+      vncMountTimer = setTimeout(() => {
+        vncMountTimer = null;
+        if (!vncShow.value || !vncUrl.value) return;
+        vncContentReady.value = true;
+      }, delayMs);
+    }
+
+    const onVncEnter = (el, done) => {
+      setNonCriticalMotionPaused(true);
+      if (prefersReducedMotionGlobal()) {
+        const panel = el.querySelector(".vnc-modal");
+        el.style.opacity = "1";
+        if (panel) {
+          panel.style.opacity = "1";
+          panel.style.transform = "none";
+        }
+        scheduleVncContentMount();
+        done();
+        return;
+      }
+      const panel = el.querySelector(".vnc-modal");
+      const fade = safeAnimate(
+        el,
+        [{ opacity: 0 }, { opacity: 1 }],
+        { duration: 0.12, easing: "ease-out" },
+        { critical: true }
+      ).finished;
+      const pop = panel
+        ? safeAnimate(
+          panel,
+          [
+            { opacity: 0, transform: "translate3d(0, 8px, 0) scale(0.96)" },
+            { opacity: 1, transform: "translate3d(0, 0, 0) scale(1)" }
+          ],
+          { duration: 0.2, easing: "cubic-bezier(.22,1,.36,1)" },
+          { critical: true }
+        ).finished
+        : Promise.resolve();
+      Promise.all([fade, pop]).then(() => {
+        scheduleVncContentMount();
+        done();
+      }).catch(done);
+    };
+
+    const onVncLeave = (el, done) => {
+      if (prefersReducedMotionGlobal()) {
+        setNonCriticalMotionPaused(false);
+        done();
+        return;
+      }
+      const panel = el.querySelector(".vnc-modal");
+      const fade = safeAnimate(
+        el,
+        [{ opacity: 1 }, { opacity: 0 }],
+        { duration: 0.12, easing: "ease-out" },
+        { critical: true }
+      ).finished;
+      const pop = panel
+        ? safeAnimate(
+          panel,
+          [
+            { opacity: 1, transform: "translate3d(0, 0, 0) scale(1)" },
+            { opacity: 0, transform: "translate3d(0, 8px, 0) scale(0.96)" }
+          ],
+          { duration: 0.18, easing: "cubic-bezier(.4,0,.2,1)" },
+          { critical: true }
+        ).finished
+        : Promise.resolve();
+      Promise.all([fade, pop]).then(() => {
+        setNonCriticalMotionPaused(false);
+        done();
+      }).catch(() => {
+        setNonCriticalMotionPaused(false);
+        done();
+      });
     }
 
     function monitorLabel(rawKey) {
@@ -3880,6 +4081,11 @@ const ProductDetailPage = {
       if (typeof document !== "undefined") {
         document.removeEventListener("visibilitychange", onPageVisibilityChange);
       }
+      if (vncMountTimer) {
+        clearTimeout(vncMountTimer);
+        vncMountTimer = null;
+      }
+      setNonCriticalMotionPaused(false);
     });
 
     return {
@@ -3916,12 +4122,15 @@ const ProductDetailPage = {
       vncShow,
       vncLoading,
       vncUrl,
+      vncContentReady,
       opLoading,
       opErrorText,
       opApiPath,
       autoRefreshText,
       showBtPanelButton,
-      showXtermButton
+      showXtermButton,
+      onVncEnter,
+      onVncLeave
     };
   }
 };
@@ -3960,12 +4169,12 @@ const PromoPage = {
           <a-button class="line-btn sm" size="small" type="outline" @click="openDailyReport">每日收益分析</a-button>
         </div>
         <div><b>{{ promoAnimated.totalIncome }}</b><span>总收益(元)</span></div>
-        <div><b>{{ promoAnimated.subUserAll }}</b><span>总客户数</span></div>
-        <div><b>{{ promoAnimated.totalStockAll }}</b><span>累计进货</span></div>
-        <div><b>{{ promoAnimated.totalPointsAll }}</b><span>累计积分</span></div>
-        <div><b>{{ promoAnimated.incomePerUser }}</b><span>单客累计贡献(元)</span></div>
-        <div><b>{{ promoAnimated.avgAllDaily }}</b><span>累计日均收益(元)</span></div>
-        <div><b>{{ promoAnimated.activeDays }}</b><span>经营天数</span></div>
+        <div><b>{{ promo.subUserAll }}</b><span>总客户数</span></div>
+        <div><b>{{ promo.totalStockAll }}</b><span>累计进货</span></div>
+        <div><b>{{ promo.totalPointsAll }}</b><span>累计积分</span></div>
+        <div><b>{{ promo.incomePerUser }}</b><span>单客累计贡献(元)</span></div>
+        <div><b>{{ promo.avgAllDaily }}</b><span>累计日均收益(元)</span></div>
+        <div><b>{{ promo.activeDays }}</b><span>经营天数</span></div>
       </section>
 
       <section class="panel kpi-grid">
@@ -3976,9 +4185,9 @@ const PromoPage = {
         <div><b>{{ promoAnimated.monthIncome }}</b><span>本月收益(元)</span></div>
         <div><b>{{ promoAnimated.prevMonthIncome }}</b><span>上月收益(元)</span></div>
         <div><b>{{ promo.momRate }}</b><span>收益环比</span></div>
-        <div><b>{{ promoAnimated.todayStock }}</b><span>今日进货</span></div>
-        <div><b>{{ promoAnimated.monthStock }}</b><span>本月进货</span></div>
-        <div><b>{{ promoAnimated.monthNewUser }}</b><span>本月新增客户</span></div>
+        <div><b>{{ promo.todayStock }}</b><span>今日进货</span></div>
+        <div><b>{{ promo.monthStock }}</b><span>本月进货</span></div>
+        <div><b>{{ promo.monthNewUser }}</b><span>本月新增客户</span></div>
       </section>
 
       <section class="panel">
@@ -4008,8 +4217,9 @@ const PromoPage = {
         <div class="kv"><span>可自定义推广码</span><b>{{ promo.canCustomCode }}</b></div>
       </section>
 
+      <transition :css="false" @enter="onDailyReportEnter" @leave="onDailyReportLeave">
       <div v-if="showDailyReport" class="promo-report-mask" @click.self="closeDailyReport">
-        <div class="promo-report-modal">
+        <div class="promo-report-modal app-dialog">
           <div class="promo-report-head">
             <h3>每日收益分析</h3>
             <button class="about-close" @click="closeDailyReport"><i class="fa-solid fa-xmark"></i></button>
@@ -4046,6 +4256,7 @@ const PromoPage = {
           </div>
         </div>
       </div>
+      </transition>
     </MobileShell>
   `,
   setup() {
@@ -4169,17 +4380,8 @@ const PromoPage = {
     });
     const promoAnimated = reactive({
       totalIncome: useAnimatedNumber(computed(() => promo.value.totalIncomeRaw), (n) => (n === null ? "-" : formatFixed2(n)), { duration: 0.46 }),
-      subUserAll: useAnimatedNumber(computed(() => promo.value.subUserAllRaw), (n) => (n === null ? "-" : formatCount(n)), { duration: 0.34 }),
-      totalStockAll: useAnimatedNumber(computed(() => promo.value.totalStockAllRaw), (n) => (n === null ? "-" : formatFixed2(n)), { duration: 0.42 }),
-      totalPointsAll: useAnimatedNumber(computed(() => promo.value.totalPointsAllRaw), (n) => (n === null ? "-" : formatCount(n)), { duration: 0.4 }),
-      incomePerUser: useAnimatedNumber(computed(() => promo.value.incomePerUserRaw), (n) => (n === null ? "-" : formatFixed2(n)), { duration: 0.4 }),
-      avgAllDaily: useAnimatedNumber(computed(() => promo.value.avgAllDailyRaw), (n) => (n === null ? "-" : formatFixed2(n)), { duration: 0.4 }),
-      activeDays: useAnimatedNumber(computed(() => promo.value.activeDaysRaw), (n) => (n === null ? "-" : formatCount(n)), { duration: 0.34 }),
       monthIncome: useAnimatedNumber(computed(() => promo.value.monthIncomeRaw), (n) => (n === null ? "-" : formatFixed2(n)), { duration: 0.46 }),
-      prevMonthIncome: useAnimatedNumber(computed(() => promo.value.prevMonthIncomeRaw), (n) => (n === null ? "-" : formatFixed2(n)), { duration: 0.46 }),
-      todayStock: useAnimatedNumber(computed(() => promo.value.todayStockRaw), (n) => (n === null ? "-" : formatCount(n)), { duration: 0.36 }),
-      monthStock: useAnimatedNumber(computed(() => promo.value.monthStockRaw), (n) => (n === null ? "-" : formatFixed2(n)), { duration: 0.4 }),
-      monthNewUser: useAnimatedNumber(computed(() => promo.value.monthNewUserRaw), (n) => (n === null ? "-" : formatCount(n)), { duration: 0.34 })
+      prevMonthIncome: useAnimatedNumber(computed(() => promo.value.prevMonthIncomeRaw), (n) => (n === null ? "-" : formatFixed2(n)), { duration: 0.46 })
     });
     const avatar = computed(() => {
       const profile = store.userProfile || {};
@@ -4497,11 +4699,67 @@ const PromoPage = {
     function closeDailyReport() {
       showDailyReport.value = false;
     }
+    const onDailyReportEnter = (el, done) => {
+      if (prefersReducedMotionGlobal()) {
+        const modal = el.querySelector(".promo-report-modal");
+        el.style.opacity = "1";
+        if (modal) {
+          modal.style.opacity = "1";
+          modal.style.transform = "none";
+        }
+        done();
+        return;
+      }
+      const modal = el.querySelector(".promo-report-modal");
+      const fade = safeAnimate(
+        el,
+        [{ opacity: 0 }, { opacity: 1 }],
+        { duration: 0.12, easing: "ease-out" },
+        { critical: true }
+      ).finished;
+      const pop = modal
+        ? safeAnimate(
+          modal,
+          [
+            { opacity: 0, transform: "translate3d(0, 8px, 0) scale(0.96)" },
+            { opacity: 1, transform: "translate3d(0, 0, 0) scale(1)" }
+          ],
+          { duration: 0.2, easing: "cubic-bezier(.22,1,.36,1)" },
+          { critical: true }
+        ).finished
+        : Promise.resolve();
+      Promise.all([fade, pop]).then(done).catch(done);
+    };
+    const onDailyReportLeave = (el, done) => {
+      if (prefersReducedMotionGlobal()) {
+        done();
+        return;
+      }
+      const modal = el.querySelector(".promo-report-modal");
+      const fade = safeAnimate(
+        el,
+        [{ opacity: 1 }, { opacity: 0 }],
+        { duration: 0.12, easing: "ease-out" },
+        { critical: true }
+      ).finished;
+      const pop = modal
+        ? safeAnimate(
+          modal,
+          [
+            { opacity: 1, transform: "translate3d(0, 0, 0) scale(1)" },
+            { opacity: 0, transform: "translate3d(0, 8px, 0) scale(0.96)" }
+          ],
+          { duration: 0.2, easing: "cubic-bezier(.4,0,.2,1)" },
+          { critical: true }
+        ).finished
+        : Promise.resolve();
+      Promise.all([fade, pop]).then(done).catch(done);
+    };
     onMounted(async () => {
       await refreshSummary(false);
       syncPromoIncomeFromDetail({ force: false });
     });
-    return { avatar, promo, promoAnimated, copyLink, openLink, shareLink, showDailyReport, dailyReport, openDailyReport, refreshDailyReport, closeDailyReport };
+    return { avatar, promo, promoAnimated, copyLink, openLink, shareLink, showDailyReport, dailyReport, openDailyReport, refreshDailyReport, closeDailyReport, onDailyReportEnter, onDailyReportLeave };
   }
 };
 
@@ -4660,8 +4918,9 @@ const MePage = {
         </div>
       </section>
 
+      <transition :css="false" @enter="onAboutModalEnter" @leave="onAboutModalLeave">
       <div v-if="showAboutModal" class="about-modal-mask" @click.self="closeAbout">
-        <div class="about-modal">
+        <div class="about-modal app-dialog">
           <div class="about-modal-head">
             <a-typography-title :heading="5" class="typo-title">关于应用</a-typography-title>
             <button class="about-close" @click="closeAbout"><i class="fa-solid fa-xmark"></i></button>
@@ -4699,6 +4958,7 @@ const MePage = {
           </div>
         </div>
       </div>
+      </transition>
 
     </MobileShell>
   `,
@@ -4762,6 +5022,62 @@ const MePage = {
     function closeAbout() {
       showAboutModal.value = false;
     }
+    const onAboutModalEnter = (el, done) => {
+      if (prefersReducedMotionGlobal()) {
+        const panel = el.querySelector(".about-modal");
+        el.style.opacity = "1";
+        if (panel) {
+          panel.style.opacity = "1";
+          panel.style.transform = "none";
+        }
+        done();
+        return;
+      }
+      const panel = el.querySelector(".about-modal");
+      const fade = safeAnimate(
+        el,
+        [{ opacity: 0 }, { opacity: 1 }],
+        { duration: 0.12, easing: "ease-out" },
+        { critical: true }
+      ).finished;
+      const pop = panel
+        ? safeAnimate(
+          panel,
+          [
+            { opacity: 0, transform: "translate3d(0, 8px, 0) scale(0.96)" },
+            { opacity: 1, transform: "translate3d(0, 0, 0) scale(1)" }
+          ],
+          { duration: 0.2, easing: "cubic-bezier(.22,1,.36,1)" },
+          { critical: true }
+        ).finished
+        : Promise.resolve();
+      Promise.all([fade, pop]).then(done).catch(done);
+    };
+    const onAboutModalLeave = (el, done) => {
+      if (prefersReducedMotionGlobal()) {
+        done();
+        return;
+      }
+      const panel = el.querySelector(".about-modal");
+      const fade = safeAnimate(
+        el,
+        [{ opacity: 1 }, { opacity: 0 }],
+        { duration: 0.12, easing: "ease-out" },
+        { critical: true }
+      ).finished;
+      const pop = panel
+        ? safeAnimate(
+          panel,
+          [
+            { opacity: 1, transform: "translate3d(0, 0, 0) scale(1)" },
+            { opacity: 0, transform: "translate3d(0, 8px, 0) scale(0.96)" }
+          ],
+          { duration: 0.2, easing: "cubic-bezier(.4,0,.2,1)" },
+          { critical: true }
+        ).finished
+        : Promise.resolve();
+      Promise.all([fade, pop]).then(done).catch(done);
+    };
 
     async function fetchUpdatePayload() {
       const urls = [UPDATE_FEED_URL, `${UPDATE_BASE_URL}/`];
@@ -4834,6 +5150,8 @@ const MePage = {
       logout,
       openAbout,
       closeAbout,
+      onAboutModalEnter,
+      onAboutModalLeave,
       checkUpdate
     };
   }
@@ -4942,10 +5260,11 @@ const RootApp = {
         done();
         return;
       }
-      animate(
+      safeAnimate(
         el,
         [{ opacity: 0, transform: "translate3d(0, 10px, 0) scale(0.992)" }, { opacity: 1, transform: "translate3d(0, 0, 0) scale(1)" }],
-        { duration: 0.32, easing: "cubic-bezier(.22,1,.36,1)" }
+        { duration: 0.32, easing: "cubic-bezier(.22,1,.36,1)" },
+        { critical: true }
       ).finished.then(done).catch(done);
     };
 
@@ -4954,10 +5273,11 @@ const RootApp = {
         done();
         return;
       }
-      animate(
+      safeAnimate(
         el,
         [{ opacity: 1, transform: "translate3d(0, 0, 0) scale(1)" }, { opacity: 0, transform: "translate3d(0, -8px, 0) scale(0.996)" }],
-        { duration: 0.24, easing: "ease-out" }
+        { duration: 0.24, easing: "ease-out" },
+        { critical: true }
       ).finished.then(done).catch(done);
     };
 
@@ -4969,15 +5289,16 @@ const RootApp = {
         return;
       }
       const shift = readNavShift();
-      const fromX = Number(shift.x || 0) * 1.2;
-      const fromY = (Number(shift.y || 0) * 1.2) + 18;
-      const pageAnim = animate(
+      const fromX = Number(shift.x || 0) * 0.2;
+      const fromY = 8 + (Number(shift.y || 0) * 0.2);
+      const pageAnim = safeAnimate(
         el,
         [
-          { opacity: 0.001, transform: `translate3d(${fromX.toFixed(2)}px, ${fromY.toFixed(2)}px, 0) scale(0.978)` },
+          { opacity: 0.001, transform: `translate3d(${fromX.toFixed(2)}px, ${fromY.toFixed(2)}px, 0)` },
           { opacity: 1, transform: "translate3d(0, 0, 0) scale(1)" }
         ],
-        { duration: 0.42, easing: "cubic-bezier(.22,1,.36,1)" }
+        { duration: 0.18, easing: "cubic-bezier(.22,1,.36,1)" },
+        { critical: true }
       ).finished;
 
       const stagedSelectors = [
@@ -4990,21 +5311,22 @@ const RootApp = {
         ".kv",
         ".promo-report-row"
       ];
-      const stagedNodes = Array.from(el.querySelectorAll(stagedSelectors.join(","))).slice(0, 36);
+      const stagedNodes = Array.from(el.querySelectorAll(stagedSelectors.join(","))).slice(0, 8);
       stagedNodes.forEach((node, idx) => {
         if (!node || node.dataset.pageMotionInited === "1") return;
         node.dataset.pageMotionInited = "1";
-        animate(
+        safeAnimate(
           node,
           [
             { opacity: 0.001, transform: "translate3d(0, 14px, 0) scale(0.986)" },
             { opacity: 1, transform: "translate3d(0, 0, 0) scale(1)" }
           ],
           {
-            duration: 0.34,
-            delay: Math.min(0.028 * idx, 0.36),
+            duration: 0.24,
+            delay: Math.min(0.024 * idx, 0.14),
             easing: "cubic-bezier(.22,1,.36,1)"
-          }
+          },
+          { critical: false }
         );
       });
 
@@ -5017,13 +5339,14 @@ const RootApp = {
         return;
       }
       const shift = readNavShift();
-      animate(
+      safeAnimate(
         el,
         [
           { opacity: 1, transform: "translate3d(0, 0, 0) scale(1)" },
-          { opacity: 0.001, transform: `translate3d(${(-0.7 * shift.x).toFixed(2)}px, ${(10 + (-0.7 * shift.y)).toFixed(2)}px, 0) scale(0.986)` }
+          { opacity: 0.001, transform: `translate3d(${(-0.2 * shift.x).toFixed(2)}px, ${(8 + (-0.2 * shift.y)).toFixed(2)}px, 0)` }
         ],
-        { duration: 0.2, easing: "cubic-bezier(.4,0,.2,1)" }
+        { duration: 0.18, easing: "cubic-bezier(.4,0,.2,1)" },
+        { critical: true }
       ).finished.then(done).catch(done);
     };
 
@@ -5044,31 +5367,38 @@ const RootApp = {
         return;
       }
       const panel = el.querySelector(".app-dialog");
-      const fade = animate(el, [{ opacity: 0 }, { opacity: 1 }], { duration: 0.24, easing: "ease-out" }).finished;
+      const fade = safeAnimate(
+        el,
+        [{ opacity: 0 }, { opacity: 1 }],
+        { duration: 0.12, easing: "ease-out" },
+        { critical: true }
+      ).finished;
       const pop = panel
-        ? animate(
+        ? safeAnimate(
           panel,
           [
-            { opacity: 0, transform: "translate3d(0, 24px, 0) scale(0.94)" },
+            { opacity: 0, transform: "translate3d(0, 8px, 0) scale(0.96)" },
             { opacity: 1, transform: "translate3d(0, 0, 0) scale(1)" }
           ],
-          { duration: 0.32, easing: "cubic-bezier(.22,1,.36,1)" }
+          { duration: 0.2, easing: "cubic-bezier(.22,1,.36,1)" },
+          { critical: true }
         ).finished
         : Promise.resolve();
       if (panel) {
         const parts = Array.from(panel.querySelectorAll(".app-dialog-head, .app-dialog-body, .app-dialog-actions"));
         parts.forEach((part, idx) => {
-          animate(
+          safeAnimate(
             part,
             [
               { opacity: 0.001, transform: "translate3d(0, 8px, 0)" },
               { opacity: 1, transform: "translate3d(0, 0, 0)" }
             ],
             {
-              duration: 0.26,
-              delay: 0.03 + (idx * 0.028),
+              duration: 0.16,
+              delay: 0.02 + (idx * 0.015),
               easing: "cubic-bezier(.22,1,.36,1)"
-            }
+            },
+            { critical: true }
           );
         });
       }
@@ -5089,15 +5419,21 @@ const RootApp = {
         return;
       }
       const panel = el.querySelector(".app-dialog");
-      const fade = animate(el, [{ opacity: 1 }, { opacity: 0 }], { duration: 0.2, easing: "ease-out" }).finished;
+      const fade = safeAnimate(
+        el,
+        [{ opacity: 1 }, { opacity: 0 }],
+        { duration: 0.12, easing: "ease-out" },
+        { critical: true }
+      ).finished;
       const pop = panel
-        ? animate(
+        ? safeAnimate(
           panel,
           [
             { opacity: 1, transform: "translate3d(0, 0, 0) scale(1)" },
-            { opacity: 0, transform: "translate3d(0, 14px, 0) scale(0.972)" }
+            { opacity: 0, transform: "translate3d(0, 8px, 0) scale(0.96)" }
           ],
-          { duration: 0.2, easing: "cubic-bezier(.4,0,.2,1)" }
+          { duration: 0.2, easing: "cubic-bezier(.4,0,.2,1)" },
+          { critical: true }
         ).finished
         : Promise.resolve();
       Promise.all([fade, pop]).then(done).catch(done);
