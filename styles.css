@@ -613,6 +613,26 @@ body {
 }
 .entry:active { transform: translateY(1px) scale(.99); }
 
+.stat-cell b,
+.kpi-grid b,
+.me-stats b,
+.promo-report-kv b,
+.todo-card b,
+.id-card b {
+  font-variant-numeric: tabular-nums;
+}
+
+.id-card,
+.todo-card,
+.entry,
+.line-btn,
+.m-header-account,
+.news-item {
+  transform: translateZ(0);
+  backface-visibility: hidden;
+  will-change: transform;
+}
+
 @media (hover: hover) and (pointer: fine) {
   .panel:hover {
     transform: translateY(-1px);

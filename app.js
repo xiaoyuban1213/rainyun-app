@@ -1,4 +1,4 @@
-import { createApp, reactive, computed, ref, onMounted, onUnmounted, watch } from "vue";
+import { createApp, reactive, computed, ref, onMounted, onUnmounted, watch, nextTick } from "vue";
 import { createRouter, createWebHashHistory, useRouter, useRoute } from "vue-router";
 import { Capacitor } from "@capacitor/core";
 import { animate } from "@motionone/dom";
@@ -23,6 +23,11 @@ const SEASON_BG_MAP = {
 const UPDATE_BASE_URL = "http://ros.yuban.cloud/app";
 const UPDATE_FEED_URL = `${UPDATE_BASE_URL}/latest.json`;
 const DETAIL_AUTO_REFRESH_MS = 6000;
+const API_TTL_FAST_MS = 6000;
+const API_TTL_META_MS = 10000;
+const API_REQUEST_LOG_FLUSH_MS = 1200;
+const API_REQUEST_LOG_FLUSH_BATCH = 18;
+const API_REQUEST_LOG_MONITOR_DEDUPE_MS = 4000;
 let navOriginTrackerInited = false;
 
 function syncAppViewportHeight() {
@@ -110,6 +115,7 @@ const store = reactive({
   summarySource: "",
   rawSummary: null,
   userProfile: null,
+  cachedAvatarUrl: loadCachedAvatarUrl(),
   userCoupons: [],
   userCouponsAt: 0,
   homeNews: [],
@@ -128,6 +134,7 @@ const COUPON_TTL_MS = 60 * 1000;
 const API_REQUEST_CACHE_KEY = "rainyun-api-request-cache";
 const PROMO_DAILY_CACHE_KEY = "rainyun-promo-income-daily-cache";
 const PROMO_RESELL_DETAIL_CACHE_KEY = "rainyun-promo-resell-detail-cache";
+const USER_AVATAR_CACHE_KEY = "rainyun-user-avatar-url";
 const API_REQUEST_CACHE_LIMIT = 240;
 const PROMO_DAILY_CACHE_LIMIT = 180;
 const PROMO_RESELL_DETAIL_TTL_MS = 5 * 60 * 1000;
@@ -140,6 +147,11 @@ const BOOT_FORCE_CLOSE_MS = 2200;
 const BOOT_EMA_ALPHA = 0.35;
 const AUTH_LOGIN_PATHS = ["/user/login", "/auth/login", "/login", "/account/login"];
 const TENCENT_CAPTCHA_APP_ID = "2039519451";
+const apiRequestLogBuffer = [];
+const apiRequestLogRecentMap = new Map();
+const apiRequestPreferredBase = { value: "", at: 0 };
+let apiRequestLogFlushTimer = null;
+let apiRequestLogHooksInited = false;
 
 function toast(msg) {
   const el = document.getElementById("toast");
@@ -267,6 +279,27 @@ function loadAuth() {
   }
 }
 
+function loadCachedAvatarUrl() {
+  try {
+    return String(localStorage.getItem(USER_AVATAR_CACHE_KEY) || "").trim();
+  } catch {
+    return "";
+  }
+}
+
+function saveCachedAvatarUrl(url) {
+  const text = String(url || "").trim();
+  try {
+    if (!text) {
+      localStorage.removeItem(USER_AVATAR_CACHE_KEY);
+      return;
+    }
+    localStorage.setItem(USER_AVATAR_CACHE_KEY, text);
+  } catch {
+    // ignore storage errors
+  }
+}
+
 function saveAuth(nextAuth) {
   store.auth = {
     baseUrl: (nextAuth.baseUrl || "https://api.v2.rainyun.com").trim(),
@@ -276,8 +309,20 @@ function saveAuth(nextAuth) {
     account: (nextAuth.account || "").trim()
   };
   localStorage.setItem("rainyun-auth", JSON.stringify(store.auth));
+  if (!isAuthenticated()) {
+    store.cachedAvatarUrl = "";
+    saveCachedAvatarUrl("");
+  }
   apiGetCache.clear();
   apiGetInflight.clear();
+  apiRequestPreferredBase.value = "";
+  apiRequestPreferredBase.at = 0;
+  apiRequestLogRecentMap.clear();
+  apiRequestLogBuffer.length = 0;
+  if (apiRequestLogFlushTimer) {
+    clearTimeout(apiRequestLogFlushTimer);
+    apiRequestLogFlushTimer = null;
+  }
   store.renewDueRows = [];
   store.renewDueCount = 0;
   store.renewDueAt = 0;
@@ -475,14 +520,60 @@ function parsePromoTotalIncomeFromUserData(userData) {
   return metrics.totalIncome;
 }
 
-function appendApiRequestCache(entry) {
+function shouldPersistApiRequestLog(method, path) {
+  if (String(method || "").toUpperCase() !== "GET") return true;
+  const normalizedPath = String(path || "").toLowerCase();
+  const isHighFreqMonitor = normalizedPath.includes("/monitor") || normalizedPath.includes("/metrics");
+  if (!isHighFreqMonitor) return true;
+  const now = Date.now();
+  const key = `${String(method || "").toUpperCase()}|${normalizedPath}`;
+  const lastAt = Number(apiRequestLogRecentMap.get(key) || 0);
+  if (lastAt && (now - lastAt) < API_REQUEST_LOG_MONITOR_DEDUPE_MS) {
+    return false;
+  }
+  apiRequestLogRecentMap.set(key, now);
+  return true;
+}
+
+function flushApiRequestCacheBuffer() {
+  if (!apiRequestLogBuffer.length) return;
   const list = readJsonCache(API_REQUEST_CACHE_KEY, []);
   const next = Array.isArray(list) ? list : [];
-  next.push(entry);
+  next.push(...apiRequestLogBuffer.splice(0, apiRequestLogBuffer.length));
   if (next.length > API_REQUEST_CACHE_LIMIT) {
     next.splice(0, next.length - API_REQUEST_CACHE_LIMIT);
   }
   writeJsonCache(API_REQUEST_CACHE_KEY, next);
+}
+
+function scheduleApiRequestCacheFlush() {
+  if (apiRequestLogBuffer.length >= API_REQUEST_LOG_FLUSH_BATCH) {
+    if (apiRequestLogFlushTimer) {
+      clearTimeout(apiRequestLogFlushTimer);
+      apiRequestLogFlushTimer = null;
+    }
+    flushApiRequestCacheBuffer();
+    return;
+  }
+  if (apiRequestLogFlushTimer) return;
+  apiRequestLogFlushTimer = setTimeout(() => {
+    apiRequestLogFlushTimer = null;
+    flushApiRequestCacheBuffer();
+  }, API_REQUEST_LOG_FLUSH_MS);
+}
+
+function ensureApiRequestCacheHooks() {
+  if (apiRequestLogHooksInited || typeof window === "undefined") return;
+  apiRequestLogHooksInited = true;
+  const flush = () => flushApiRequestCacheBuffer();
+  window.addEventListener("pagehide", flush, { passive: true });
+  window.addEventListener("beforeunload", flush, { passive: true });
+}
+
+function appendApiRequestCache(entry) {
+  apiRequestLogBuffer.push(entry);
+  ensureApiRequestCacheHooks();
+  scheduleApiRequestCacheFlush();
 }
 
 function appendPromoDailySnapshotFromUserPayload(payload) {
@@ -641,7 +732,7 @@ async function fetchPromoResellDetailRows(options = {}) {
       page,
       perPage
     }));
-    const payload = await apiGet(`/user/vip/resell_detail?options=${optionsText}`, { force, ttlMs: 15000 });
+    const payload = await apiGet(`/user/vip/resell_detail?options=${optionsText}`, { force, ttlMs: API_TTL_META_MS });
     const data = extractPayloadData(payload) || {};
     const records = Array.isArray(data.Records) ? data.Records : (Array.isArray(data.records) ? data.records : []);
     if (!records.length) break;
@@ -667,7 +758,7 @@ async function fetchCoupons(options = {}) {
 
   if (!force && couponInflightPromise) return couponInflightPromise;
   couponInflightPromise = (async () => {
-    const payload = await apiGet("/user/coupons/", { force, ttlMs: 30000 });
+    const payload = await apiGet("/user/coupons/", { force, ttlMs: API_TTL_META_MS });
     const data = extractPayloadData(payload);
     const items = Array.isArray(data) ? data : [];
     store.userCoupons = items;
@@ -769,6 +860,89 @@ function formatFixed2(v) {
   return n === null ? String(v ?? "-") : n.toFixed(2);
 }
 
+function prefersReducedMotionGlobal() {
+  if (typeof window === "undefined" || !window.matchMedia) return false;
+  return Boolean(window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+}
+
+function toAnimNumber(v) {
+  if (v === null || v === undefined || v === "") return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function useAnimatedNumber(sourceRef, formatter, options = {}) {
+  const duration = Number.isFinite(Number(options.duration)) ? Number(options.duration) : 0.5;
+  const displayed = ref("");
+  let current = toAnimNumber(sourceRef.value);
+  let rafId = 0;
+  let animToken = 0;
+
+  const paint = (v) => {
+    displayed.value = formatter(v);
+  };
+
+  const stop = () => {
+    animToken += 1;
+    if (rafId) {
+      cancelAnimationFrame(rafId);
+      rafId = 0;
+    }
+  };
+
+  const easeOut = (t) => {
+    const x = Math.max(0, Math.min(1, Number(t) || 0));
+    return 1 - ((1 - x) ** 3);
+  };
+
+  const runTo = (nextRaw, immediate = false) => {
+    const next = toAnimNumber(nextRaw);
+    if (next === null) {
+      stop();
+      current = null;
+      paint(null);
+      return;
+    }
+    if (current === null || immediate || prefersReducedMotionGlobal()) {
+      stop();
+      current = next;
+      paint(next);
+      return;
+    }
+    if (Math.abs(next - current) < 0.000001) {
+      current = next;
+      paint(next);
+      return;
+    }
+    stop();
+    const token = animToken;
+    const from = current;
+    const startedAt = performance.now();
+    const totalMs = Math.max(120, duration * 1000);
+    const tick = (ts) => {
+      if (token !== animToken) return;
+      const progress = Math.min(1, (ts - startedAt) / totalMs);
+      const eased = easeOut(progress);
+      const value = from + ((next - from) * eased);
+      current = value;
+      paint(value);
+      if (progress < 1) {
+        rafId = requestAnimationFrame(tick);
+      } else {
+        rafId = 0;
+        current = next;
+        paint(next);
+      }
+    };
+    rafId = requestAnimationFrame(tick);
+  };
+
+  watch(sourceRef, (next) => runTo(next, false));
+  onMounted(() => runTo(sourceRef.value, true));
+  onUnmounted(() => stop());
+  return displayed;
+}
+
 function formatDate(v) {
   if (v === null || v === undefined || v === "") return "-";
   const n = Number(v);
@@ -857,9 +1031,21 @@ function apiGetCacheKey(path) {
   return `${String(store.auth.baseUrl || "").trim()}|${String(store.auth.authMode || "apiKey").trim()}|${String(store.auth.account || "").trim()}|${String(store.auth.apiKey || "").trim()}|${String(store.auth.devToken || "").trim()}|${path}`;
 }
 
+function defaultApiTtlMsByPath(path) {
+  const normalizedPath = String(path || "");
+  if (!normalizedPath) return API_GET_DEFAULT_TTL;
+  if (normalizedPath.startsWith("/news") || normalizedPath.startsWith("/product/") || normalizedPath === "/product/") {
+    return API_TTL_META_MS;
+  }
+  if (normalizedPath.includes("/monitor") || normalizedPath.includes("/metrics")) {
+    return API_TTL_FAST_MS;
+  }
+  return API_GET_DEFAULT_TTL;
+}
+
 async function apiGet(path, options = {}) {
   const force = Boolean(options.force);
-  const ttlMs = Number.isFinite(Number(options.ttlMs)) ? Math.max(0, Number(options.ttlMs)) : API_GET_DEFAULT_TTL;
+  const ttlMs = Number.isFinite(Number(options.ttlMs)) ? Math.max(0, Number(options.ttlMs)) : defaultApiTtlMsByPath(path);
   const key = apiGetCacheKey(path);
 
   if (!force && ttlMs > 0) {
@@ -892,11 +1078,15 @@ async function apiRequest(method, path, body) {
   const configuredBase = String(store.auth.baseUrl || "").trim().replace(/\/$/, "");
   const baseCandidates = [configuredBase, "https://api.v2.rainyun.com"].filter(Boolean);
   const baseList = [...new Set(baseCandidates)];
+  const preferredBase = String(apiRequestPreferredBase.value || "");
+  const orderedBaseList = preferredBase && baseList.includes(preferredBase)
+    ? [preferredBase, ...baseList.filter((x) => x !== preferredBase)]
+    : baseList;
   const options = { method, headers: authHeaders() };
   if (body !== undefined) options.body = JSON.stringify(body);
 
   let lastError = null;
-  for (const base of baseList) {
+  for (const base of orderedBaseList) {
     const url = `${base}${path}`;
     try {
       reportLog("INFO", "api_request_start", { method, url });
@@ -916,28 +1106,32 @@ async function apiRequest(method, path, body) {
       } catch {
         payload = { raw: text };
       }
-      appendApiRequestCache({
-        at: new Date().toISOString(),
-        method,
-        path,
-        url,
-        status: Number(res.status),
-        ok: Boolean(res.ok),
-        code: payload && typeof payload === "object" ? payload.code : undefined,
-        // 控制体积，避免本地缓存无限膨胀
-        payload:
-          payload && typeof payload === "object"
-            ? JSON.parse(JSON.stringify(payload, (k, v) => {
-              if (typeof v === "string" && v.length > 200) return `${v.slice(0, 200)}...(truncated)`;
-              return v;
-            }))
-            : payload
-      });
+      if (shouldPersistApiRequestLog(method, path)) {
+        appendApiRequestCache({
+          at: new Date().toISOString(),
+          method,
+          path,
+          url,
+          status: Number(res.status),
+          ok: Boolean(res.ok),
+          code: payload && typeof payload === "object" ? payload.code : undefined,
+          // 控制体积，避免本地缓存无限膨胀
+          payload:
+            payload && typeof payload === "object"
+              ? JSON.parse(JSON.stringify(payload, (k, v) => {
+                if (typeof v === "string" && v.length > 200) return `${v.slice(0, 200)}...(truncated)`;
+                return v;
+              }))
+              : payload
+        });
+      }
       if (method === "GET" && path === "/user/" && res.ok) {
         appendPromoDailySnapshotFromUserPayload(payload);
       }
       reportLog("INFO", "api_request_done", { method, url, status: res.status, code: payload.code });
       if (!res.ok) throw new Error(`请求失败 ${res.status}`);
+      apiRequestPreferredBase.value = base;
+      apiRequestPreferredBase.at = Date.now();
       return payload;
     } catch (e) {
       lastError = e;
@@ -1183,7 +1377,7 @@ async function collectRenewRowsFromSummary(summary, options = {}) {
         const detailPath = renewDetailPath(kindName, productId);
         if (!detailPath) return null;
         try {
-          const payload = await apiGet(detailPath, { ttlMs: 15000 });
+          const payload = await apiGet(detailPath, { ttlMs: API_TTL_META_MS });
           const detailData = extractPayloadData(payload);
           const d = detailData && detailData.Data && typeof detailData.Data === "object" ? detailData.Data : detailData;
           const name = String(
@@ -1265,7 +1459,7 @@ async function splitRcsAndRgpuIds(rcsIds, force = false) {
       cursor += 1;
       const id = ids[idx];
       try {
-        const payload = await apiGet(`/product/rcs/${id}/`, { force, ttlMs: 15000 });
+        const payload = await apiGet(`/product/rcs/${id}/`, { force, ttlMs: API_TTL_META_MS });
         const detail = extractPayloadData(payload);
         if (isRgpuLikeRcsDetail(detail)) {
           rgpu.push(id);
@@ -1381,14 +1575,21 @@ async function refreshSummary(force = false) {
       });
 
       const [userRes, newsRes, productRes] = await Promise.allSettled([
-        apiGet("/user/", { force, ttlMs: 15000 }),
-        apiGet("/news", { force, ttlMs: 10000 }),
-        apiGet("/product/", { force, ttlMs: 10000 })
+        apiGet("/user/", { force, ttlMs: API_TTL_META_MS }),
+        apiGet("/news", { force, ttlMs: API_TTL_META_MS }),
+        apiGet("/product/", { force, ttlMs: API_TTL_META_MS })
       ]);
 
       if (userRes.status === "fulfilled") {
         const userPayload = userRes.value;
         store.userProfile = userPayload && userPayload.data ? userPayload.data : userPayload;
+        const profileAvatar = normalizeAssetUrl(
+          pickFirstFieldDeep(store.userProfile || {}, ["IconUrl", "iconUrl", "icon_url", "avatar", "avatar_url", "headimgurl", "head_img", "face"])
+        );
+        if (profileAvatar) {
+          store.cachedAvatarUrl = profileAvatar;
+          saveCachedAvatarUrl(profileAvatar);
+        }
       } else {
         reportLog("WARN", "user_profile_load_error", { error: String(userRes.reason) });
       }
@@ -1411,7 +1612,7 @@ async function refreshSummary(force = false) {
       let source = "/product/";
 
       if (summaryIsEmpty(s)) {
-        const p2 = await apiGet("/product/id_list", { force, ttlMs: 10000 });
+        const p2 = await apiGet("/product/id_list", { force, ttlMs: API_TTL_META_MS });
         const s2 = normalizeSummary(p2);
         if (!summaryIsEmpty(s2)) {
           s = s2;
@@ -2105,10 +2306,38 @@ const MobileShell = {
     });
     const avatar = computed(() => {
       const profile = store.userProfile || {};
-      return normalizeAssetUrl(
+      const fromProfile = normalizeAssetUrl(
         pickFirstFieldDeep(profile, ["IconUrl", "iconUrl", "icon_url", "avatar", "avatar_url", "headimgurl", "head_img", "face"]) ||
-        AVATAR
+        ""
       );
+      if (fromProfile) {
+        if (store.cachedAvatarUrl !== fromProfile) {
+          store.cachedAvatarUrl = fromProfile;
+          saveCachedAvatarUrl(fromProfile);
+        }
+        return fromProfile;
+      }
+      const fromCache = normalizeAssetUrl(store.cachedAvatarUrl || loadCachedAvatarUrl());
+      return fromCache || AVATAR;
+    });
+    onMounted(() => {
+      if (!isAuthed.value) return;
+      if (store.userProfile) return;
+      apiGet("/user/", { ttlMs: API_TTL_META_MS })
+        .then((payload) => {
+          const userPayload = payload && payload.data ? payload.data : payload;
+          store.userProfile = userPayload;
+          const profileAvatar = normalizeAssetUrl(
+            pickFirstFieldDeep(userPayload || {}, ["IconUrl", "iconUrl", "icon_url", "avatar", "avatar_url", "headimgurl", "head_img", "face"])
+          );
+          if (profileAvatar) {
+            store.cachedAvatarUrl = profileAvatar;
+            saveCachedAvatarUrl(profileAvatar);
+          }
+        })
+        .catch(() => {
+          // keep local avatar cache fallback
+        });
     });
     return { go, goAccount, tabClass, mainClass, logo: BRAND_LOGO, onTouchStart, onTouchMove, onTouchEnd, isAuthed, avatar, showAccountBtn };
   }
@@ -2169,7 +2398,7 @@ const HomePage = {
         </div>
         <div class="todo-row">
           <button class="todo-card" @click="goTodo('ticket')"><i class="fa-regular fa-life-ring"></i><b>{{ tickets }}</b><span>工单</span></button>
-          <button :class="['todo-card', { 'is-urgent': renew > 0 }]" @click="goTodo('renew')"><i class="fa-solid fa-clock-rotate-left"></i><b>{{ renew }}</b><span>待续费</span></button>
+          <button :class="['todo-card', { 'is-urgent': renewRaw > 0 }]" @click="goTodo('renew')"><i class="fa-solid fa-clock-rotate-left"></i><b>{{ renew }}</b><span>待续费</span></button>
           <button class="todo-card" @click="goTodo('coupon')"><i class="fa-solid fa-ticket"></i><b>{{ coupons }}</b><span>优惠券</span></button>
         </div>
       </section>
@@ -2231,13 +2460,13 @@ const HomePage = {
       ];
       return list;
     });
-    const productTotal = computed(() => productEntries.value.reduce((sum, item) => sum + Number(item.count || 0), 0));
-    const tickets = computed(() => 0);
-    const renew = computed(() => {
+    const productTotalRaw = computed(() => productEntries.value.reduce((sum, item) => sum + Number(item.count || 0), 0));
+    const ticketsRaw = computed(() => 0);
+    const renewRaw = computed(() => {
       const n = Number(store.renewDueCount);
       return Number.isFinite(n) && n >= 0 ? n : 0;
     });
-    const coupons = computed(() => (Array.isArray(store.userCoupons) ? store.userCoupons.length : 0));
+    const couponsRaw = computed(() => (Array.isArray(store.userCoupons) ? store.userCoupons.length : 0));
     const syncing = computed(() => store.loading);
     const lastSyncAt = computed(() => store.lastSyncAt);
     const activityNews = computed(() => {
@@ -2253,18 +2482,26 @@ const HomePage = {
       return source.slice(0, 2);
     });
 
-    const points = computed(() => formatCount(
+    const pointsRaw = computed(() => toNumberOrNull(
       pickFirstFieldDeep(profile.value, ["Points", "points", "point", "score", "integral", "credit_point", "reward_points"]) ||
       pickFirstFieldDeep(rawData.value, ["Points", "points", "point", "score", "integral", "credit_point"])
-    ));
-    const monthCost = computed(() => formatMoney(
+    ) ?? 0);
+    const monthCostRaw = computed(() => toNumberOrNull(
       pickFirstFieldDeep(profile.value, ["ConsumeMonthly", "consume_monthly", "month_cost", "month_consume", "month_pay", "month_spend"]) ||
       pickFirstFieldDeep(rawData.value, ["ConsumeMonthly", "consume_monthly", "month_cost", "month_consume", "month_pay", "month_spend"])
-    ));
-    const balance = computed(() => formatMoney(
+    ) ?? 0);
+    const balanceRaw = computed(() => toNumberOrNull(
       pickFirstFieldDeep(profile.value, ["Money", "balance", "money", "amount", "wallet", "credit", "user_money", "cash"]) ||
       pickFirstFieldDeep(rawData.value, ["Money", "balance", "money", "amount", "wallet", "credit", "user_money", "cash"])
-    ));
+    ) ?? 0);
+
+    const points = useAnimatedNumber(pointsRaw, (n) => (n === null ? "-" : formatCount(n)), { duration: 0.45 });
+    const monthCost = useAnimatedNumber(monthCostRaw, (n) => (n === null ? "-" : formatMoney(n)), { duration: 0.42 });
+    const balance = useAnimatedNumber(balanceRaw, (n) => (n === null ? "-" : formatMoney(n)), { duration: 0.42 });
+    const productTotal = useAnimatedNumber(productTotalRaw, (n) => (n === null ? "-" : formatCount(n)), { duration: 0.35 });
+    const tickets = useAnimatedNumber(ticketsRaw, (n) => (n === null ? "-" : formatCount(n)), { duration: 0.32 });
+    const renew = useAnimatedNumber(renewRaw, (n) => (n === null ? "-" : formatCount(n)), { duration: 0.32 });
+    const coupons = useAnimatedNumber(couponsRaw, (n) => (n === null ? "-" : formatCount(n)), { duration: 0.32 });
 
     const goList = (kind) => router.push(`/product/${kind}`);
     const openEntry = (item) => {
@@ -2287,7 +2524,7 @@ const HomePage = {
 
     onMounted(() => refreshSummary(false));
 
-    return { summary, source, productTotal, points, monthCost, balance, tickets, renew, coupons, syncing, lastSyncAt, activityNews, productEntries, openEntry, goList, goTodo, refresh, openNews };
+    return { summary, source, productTotal, points, monthCost, balance, tickets, renew, renewRaw, coupons, syncing, lastSyncAt, activityNews, productEntries, openEntry, goList, goTodo, refresh, openNews };
   }
 };
 
@@ -2519,8 +2756,8 @@ const ProductListPage = {
         </div>
         <div class="list-tip" v-if="keyword">匹配 {{ viewIds.length }} 项</div>
         <div v-if="!viewIds.length" class="empty">暂无匹配数据</div>
-        <div v-else class="list-cards">
-          <button v-if="showRichCard" class="id-card detail-card" v-for="id in viewIds" :key="id" @click="openDetail(id)">
+        <div v-else class="list-cards" ref="listCardsRef">
+          <button v-if="showRichCard" class="id-card detail-card" v-for="id in viewIds" :key="'detail-' + id" :data-card-id="String(id)" @click="openDetail(id)">
             <div class="detail-card-main">
               <div class="detail-card-head">
                 <b>#{{ id }}</b>
@@ -2550,7 +2787,7 @@ const ProductListPage = {
             </div>
             <i class="fa-solid fa-chevron-right detail-card-arrow"></i>
           </button>
-          <button v-else class="id-card" v-for="id in viewIds" :key="id" @click="openDetail(id)">
+          <button v-else class="id-card" v-for="id in viewIds" :key="'plain-' + id" :data-card-id="String(id)" @click="openDetail(id)">
             <div><b>#{{ id }}</b><span>{{ kindLabel }}</span></div>
             <i class="fa-solid fa-chevron-right"></i>
           </button>
@@ -2571,6 +2808,8 @@ const ProductListPage = {
     const asc = ref(true);
     const kindLabel = computed(() => getKindLabel(kind.value));
     const detailMetaMap = ref({});
+    const cardMetaInflight = new Map();
+    const listCardsRef = ref(null);
     const showIp = ref(false);
     const showRichCard = computed(() => ["rcs", "rgpu", "rgs"].includes(String(kind.value || "")));
     const viewIds = computed(() => {
@@ -2670,7 +2909,6 @@ const ProductListPage = {
       const detailData = extractPayloadData(detailPayload);
       const view = buildDetailView(kind.value, id, detailData, null) || {};
       const info = view.serverInfo || {};
-      const baseRows = Array.isArray(view.baseInfo) ? view.baseInfo : [];
       const monitorRows = Array.isArray(view.monitorRows) ? view.monitorRows : [];
       const cpuRow = pickRow(monitorRows, "CPU(%)");
       const memRow = pickRow(monitorRows, "内存使用") || pickRow(monitorRows, "内存占用");
@@ -2717,24 +2955,107 @@ const ProductListPage = {
         showMetrics: false
       };
     };
+    const animateListCards = async (force = false) => {
+      await nextTick();
+      const root = listCardsRef.value;
+      if (!root || prefersReducedMotionGlobal()) return;
+      const nodes = Array.from(root.querySelectorAll(".id-card"));
+      nodes.slice(0, 24).forEach((node, idx) => {
+        if (!node) return;
+        if (!force && node.dataset.motionInited === "1") return;
+        node.dataset.motionInited = "1";
+        node.style.willChange = "transform, opacity";
+        animate(
+          node,
+          [
+            { opacity: 0.001, transform: "translate3d(0, 18px, 0) scale(0.975)" },
+            { opacity: 1, transform: "translate3d(0, 0, 0) scale(1)" }
+          ],
+          {
+            duration: 0.42,
+            delay: Math.min(idx * 0.028, 0.34),
+            easing: "cubic-bezier(.22,1,.36,1)"
+          }
+        ).finished.finally(() => {
+          node.style.willChange = "";
+        });
+      });
+    };
+    const animateCardMetaReady = async (id) => {
+      await nextTick();
+      const root = listCardsRef.value;
+      if (!root || prefersReducedMotionGlobal()) return;
+      const node = root.querySelector(`.id-card[data-card-id="${String(id)}"]`);
+      if (!node) return;
+      const lastTs = Number(node.dataset.metaMotionTs || 0);
+      const nowTs = Date.now();
+      if (nowTs - lastTs < 1200) return;
+      node.dataset.metaMotionTs = String(nowTs);
+      node.style.willChange = "transform, opacity";
+      animate(
+        node,
+        [
+          { opacity: 0.58, transform: "translate3d(0, 9px, 0) scale(0.987)" },
+          { opacity: 1, transform: "translate3d(0, 0, 0) scale(1)" }
+        ],
+        { duration: 0.34, easing: "cubic-bezier(.22,1,.36,1)" }
+      ).finished.finally(() => {
+        node.style.willChange = "";
+      });
+    };
+    const loadCardMetaForId = async (kindName, id, force = false) => {
+      const inflightKey = `${kindName}:${id}`;
+      if (!force && cardMetaInflight.has(inflightKey)) {
+        return cardMetaInflight.get(inflightKey);
+      }
+      const p = (async () => {
+        try {
+          const detailKind = kindName === "rgpu" ? "rcs" : kindName;
+          const detailPath = `/product/${detailKind}/${id}/`;
+          const payload = await apiGet(detailPath, { force, ttlMs: API_TTL_FAST_MS });
+          const meta = toCardMeta(id, payload);
+          detailMetaMap.value = { ...detailMetaMap.value, [id]: meta };
+          animateCardMetaReady(id);
+        } catch {
+          const fallback = getCardMeta(id);
+          detailMetaMap.value = { ...detailMetaMap.value, [id]: { ...fallback, statusText: "获取失败" } };
+        } finally {
+          cardMetaInflight.delete(inflightKey);
+        }
+      })();
+      cardMetaInflight.set(inflightKey, p);
+      return p;
+    };
     const loadCardMeta = async (force = false) => {
       const kindName = String(kind.value || "");
       if (!showRichCard.value) return;
       const targets = viewIds.value.slice(0, 20).map((x) => String(x));
       if (!targets.length) return;
-      for (const id of targets) {
-        if (!force && detailMetaMap.value[id]) continue;
-        try {
-          const detailKind = kindName === "rgpu" ? "rcs" : kindName;
-          const detailPath = `/product/${detailKind}/${id}/`;
-          const payload = await apiGet(detailPath, { force, ttlMs: 15000 });
-          const meta = toCardMeta(id, payload);
-          detailMetaMap.value = { ...detailMetaMap.value, [id]: meta };
-        } catch {
-          const fallback = getCardMeta(id);
-          detailMetaMap.value = { ...detailMetaMap.value, [id]: { ...fallback, statusText: "获取失败" } };
+      const pendingIds = targets.filter((id) => force || !detailMetaMap.value[id]);
+      if (!pendingIds.length) return;
+      let cursor = 0;
+      const concurrency = Math.min(4, pendingIds.length);
+      async function worker() {
+        while (cursor < pendingIds.length) {
+          const idx = cursor;
+          cursor += 1;
+          const targetId = pendingIds[idx];
+          await loadCardMetaForId(kindName, targetId, force);
         }
       }
+      await Promise.all(Array.from({ length: concurrency }, () => worker()));
+      animateListCards();
+    };
+    let loadCardMetaDebounceTimer = null;
+    const scheduleLoadCardMeta = (force = false) => {
+      if (loadCardMetaDebounceTimer) {
+        clearTimeout(loadCardMetaDebounceTimer);
+        loadCardMetaDebounceTimer = null;
+      }
+      loadCardMetaDebounceTimer = setTimeout(() => {
+        loadCardMetaDebounceTimer = null;
+        loadCardMeta(force);
+      }, 120);
     };
     const openDetail = (id) => router.push(`/product/${kind.value}/${id}`);
     const toggleSort = () => { asc.value = !asc.value; };
@@ -2779,12 +3100,20 @@ const ProductListPage = {
       window.open(map[kindName] || "https://app.rainyun.com/", "_blank");
     };
     watch([kind, viewIds], () => {
-      loadCardMeta(false);
+      scheduleLoadCardMeta(false);
+      animateListCards();
     }, { immediate: false });
 
     onMounted(async () => {
       await refreshSummary(false);
       await loadCardMeta(false);
+      animateListCards();
+    });
+    onUnmounted(() => {
+      if (loadCardMetaDebounceTimer) {
+        clearTimeout(loadCardMetaDebounceTimer);
+        loadCardMetaDebounceTimer = null;
+      }
     });
     return {
       ids,
@@ -2800,7 +3129,8 @@ const ProductListPage = {
       refresh,
       copyAllIds,
       openMainSite,
-      getCardMeta
+      getCardMeta,
+      listCardsRef
     };
   }
 };
@@ -2987,6 +3317,10 @@ const ProductDetailPage = {
     const vncUrl = ref("");
     const autoRefreshAt = ref("");
     const detailRefreshing = ref(false);
+    const autoRefreshRunning = ref(false);
+    const autoRefreshLastRunAt = ref(0);
+    const monitorResolvedPath = ref("");
+    const monitorRetryDisabledUntil = ref(0);
     const remotePasswordVisible = ref(false);
     let detailAutoRefreshTimer = null;
     const canOperatePower = computed(() => kind.value === "rcs" || kind.value === "rgpu");
@@ -3230,7 +3564,7 @@ const ProductDetailPage = {
       const force = Boolean(options.force);
       if (detailRefreshing.value) return false;
       detailRefreshing.value = true;
-      const requestOptions = force ? { force: true, ttlMs: 0 } : (silent ? { ttlMs: 3000 } : {});
+      const requestOptions = force ? { force: true, ttlMs: 0 } : { ttlMs: API_TTL_FAST_MS };
       if (!silent) {
         loading.value = true;
         errorText.value = "";
@@ -3270,19 +3604,29 @@ const ProductDetailPage = {
         let monitorData = {};
         if (endpoint.monitor) {
           try {
-            const tryPaths = [
+            const now = Date.now();
+            const fallbackPaths = [
               endpoint.monitor,
-              ...(endpoint.monitorCandidates || []),
-              `${endpoint.monitor}?range=1h`,
-              `${endpoint.monitor}?step=60`,
-              `${endpoint.monitor}?type=basic`
+              ...(endpoint.monitorCandidates || [])
             ];
+            const dedup = [...new Set(fallbackPaths.filter(Boolean).map((x) => String(x).trim()))];
+            const currentIdSeg = `/${String(id.value || "").trim()}/`;
+            const preferredPath = String(monitorResolvedPath.value || "");
+            const preferredForCurrentId = preferredPath && preferredPath.includes(currentIdSeg) ? preferredPath : "";
+            const shouldSkipFallback = silent && now < Number(monitorRetryDisabledUntil.value || 0);
+            const primaryPath = preferredForCurrentId || dedup[0] || endpoint.monitor;
+            const secondaryPath = dedup.find((p) => p !== primaryPath) || "";
+            const tryPaths = shouldSkipFallback
+              ? [primaryPath].filter(Boolean)
+              : [primaryPath, silent ? "" : secondaryPath].filter(Boolean);
             let ok = false;
             for (const p of tryPaths) {
               try {
                 const monitorPayload = await apiGet(p, requestOptions);
                 monitorData = extractPayloadData(monitorPayload);
                 monitorPath.value = p;
+                monitorResolvedPath.value = p;
+                monitorRetryDisabledUntil.value = 0;
                 ok = true;
                 break;
               } catch {
@@ -3290,6 +3634,10 @@ const ProductDetailPage = {
               }
             }
             if (!ok) {
+              // 避免自动刷新期间持续探测多个失败候选接口导致控制台刷屏。
+              if (silent) {
+                monitorRetryDisabledUntil.value = Date.now() + 3 * 60 * 1000;
+              }
               reportLog("WARN", "monitor_api_unavailable", { kind: kind.value, id: id.value, endpoint: endpoint.monitor });
             }
           } catch (e) {
@@ -3301,8 +3649,10 @@ const ProductDetailPage = {
         if (view.serverInfo) serverInfo.value = view.serverInfo;
         remotePasswordVisible.value = false;
         configRows.value = view.configRows.length ? view.configRows : [{ key: "提示", value: "接口暂无可展示配置字段" }];
-        if (!monitorRows.value.length) {
+        if (Array.isArray(view.monitorRows) && view.monitorRows.length) {
           monitorRows.value = view.monitorRows;
+        } else if (!monitorRows.value.length) {
+          monitorRows.value = [];
         }
       } catch (e) {
         if (silent) {
@@ -3335,7 +3685,17 @@ const ProductDetailPage = {
 
     async function autoRefreshDetail() {
       if (!canAutoRefreshNow()) return;
-      const refreshed = await loadDetailCore({ silent: true, force: false });
+      const now = Date.now();
+      if (autoRefreshRunning.value) return;
+      if (autoRefreshLastRunAt.value && (now - autoRefreshLastRunAt.value) < Math.max(1500, DETAIL_AUTO_REFRESH_MS - 800)) return;
+      autoRefreshRunning.value = true;
+      autoRefreshLastRunAt.value = now;
+      let refreshed = false;
+      try {
+        refreshed = await loadDetailCore({ silent: true, force: false });
+      } finally {
+        autoRefreshRunning.value = false;
+      }
       if (refreshed) {
         autoRefreshAt.value = new Date().toLocaleTimeString("zh-CN", { hour12: false });
       }
@@ -3599,13 +3959,13 @@ const PromoPage = {
           <a-typography-title :heading="6" class="typo-title">长期经营概览</a-typography-title>
           <a-button class="line-btn sm" size="small" type="outline" @click="openDailyReport">每日收益分析</a-button>
         </div>
-        <div><b>{{ promo.totalIncome }}</b><span>总收益(元)</span></div>
-        <div><b>{{ promo.subUserAll }}</b><span>总客户数</span></div>
-        <div><b>{{ promo.totalStockAll }}</b><span>累计进货</span></div>
-        <div><b>{{ promo.totalPointsAll }}</b><span>累计积分</span></div>
-        <div><b>{{ promo.incomePerUser }}</b><span>单客累计贡献(元)</span></div>
-        <div><b>{{ promo.avgAllDaily }}</b><span>累计日均收益(元)</span></div>
-        <div><b>{{ promo.activeDays }}</b><span>经营天数</span></div>
+        <div><b>{{ promoAnimated.totalIncome }}</b><span>总收益(元)</span></div>
+        <div><b>{{ promoAnimated.subUserAll }}</b><span>总客户数</span></div>
+        <div><b>{{ promoAnimated.totalStockAll }}</b><span>累计进货</span></div>
+        <div><b>{{ promoAnimated.totalPointsAll }}</b><span>累计积分</span></div>
+        <div><b>{{ promoAnimated.incomePerUser }}</b><span>单客累计贡献(元)</span></div>
+        <div><b>{{ promoAnimated.avgAllDaily }}</b><span>累计日均收益(元)</span></div>
+        <div><b>{{ promoAnimated.activeDays }}</b><span>经营天数</span></div>
       </section>
 
       <section class="panel kpi-grid">
@@ -3613,12 +3973,12 @@ const PromoPage = {
           <a-typography-title :heading="6" class="typo-title">阶段趋势</a-typography-title>
           <a-typography-text class="panel-subtext" type="secondary">近周期指标</a-typography-text>
         </div>
-        <div><b>{{ promo.monthIncome }}</b><span>本月收益(元)</span></div>
-        <div><b>{{ promo.prevMonthIncome }}</b><span>上月收益(元)</span></div>
+        <div><b>{{ promoAnimated.monthIncome }}</b><span>本月收益(元)</span></div>
+        <div><b>{{ promoAnimated.prevMonthIncome }}</b><span>上月收益(元)</span></div>
         <div><b>{{ promo.momRate }}</b><span>收益环比</span></div>
-        <div><b>{{ promo.todayStock }}</b><span>今日进货</span></div>
-        <div><b>{{ promo.monthStock }}</b><span>本月进货</span></div>
-        <div><b>{{ promo.monthNewUser }}</b><span>本月新增客户</span></div>
+        <div><b>{{ promoAnimated.todayStock }}</b><span>今日进货</span></div>
+        <div><b>{{ promoAnimated.monthStock }}</b><span>本月进货</span></div>
+        <div><b>{{ promoAnimated.monthNewUser }}</b><span>本月新增客户</span></div>
       </section>
 
       <section class="panel">
@@ -3741,6 +4101,8 @@ const PromoPage = {
       const totalStockRaw = toNumberOrNull(pickFirstFieldDeep(p, ["StockAll", "stock_all", "promotion_total_stock"])) ?? 0;
       const subUserAllRaw = toNumberOrNull(pickFirstFieldDeep(p, ["SubUserAll", "sub_user_all", "customer_total"])) ?? 0;
       const monthNewUserRaw = toNumberOrNull(pickFirstFieldDeep(p, ["SubUserMonthly", "sub_user_monthly", "customer_monthly"])) ?? 0;
+      const todayStockRaw = toNumberOrNull(pickFirstFieldDeep(p, ["StockDaily", "today_stock", "today_purchase", "promotion_today_stock"])) ?? 0;
+      const monthStockRaw = toNumberOrNull(pickFirstFieldDeep(p, ["StockMonthly", "month_stock", "month_purchase", "promotion_month_stock"])) ?? 0;
       const totalPointsAllRaw = totalPoints ?? 0;
       const incomePerUserRaw = subUserAllRaw > 0 ? totalIncomeRaw / subUserAllRaw : null;
       const registerRaw = pickFirstFieldDeep(p, ["RegisterTime", "register_time", "RegisterDate", "register_date", "CreatedAt", "created_at", "CreateTime", "create_time", "RegTime", "reg_time"]);
@@ -3776,15 +4138,24 @@ const PromoPage = {
         todayIncomeRaw,
         detailIncomeSource: String(promoTrendFromDetail.value.source || ""),
         momRate: momRate === null ? "-" : `${momRate >= 0 ? "+" : ""}${formatFixed2(momRate)}%`,
-        todayStock: formatCount(pickFirstFieldDeep(p, ["StockDaily", "today_stock", "today_purchase", "promotion_today_stock"])),
-        monthStock: formatFixed2(pickFirstFieldDeep(p, ["StockMonthly", "month_stock", "month_purchase", "promotion_month_stock"])),
+        todayStock: formatCount(todayStockRaw),
+        todayStockRaw,
+        monthStock: formatFixed2(monthStockRaw),
+        monthStockRaw,
         subUserAll: formatCount(subUserAllRaw),
+        subUserAllRaw,
         monthNewUser: formatCount(monthNewUserRaw),
+        monthNewUserRaw,
         totalStockAll: formatFixed2(totalStockRaw),
+        totalStockAllRaw: totalStockRaw,
         totalPointsAll: formatCount(totalPointsAllRaw),
+        totalPointsAllRaw,
         incomePerUser: incomePerUserRaw === null ? "-" : formatFixed2(incomePerUserRaw),
+        incomePerUserRaw,
         avgAllDaily: avgAllDailyRaw === null ? "-" : formatFixed2(avgAllDailyRaw),
+        avgAllDailyRaw,
         activeDays: activeDays === null ? "-" : formatCount(activeDays),
+        activeDaysRaw: activeDays,
         primaryProgress: Number(primaryProgress.toFixed(2)),
         primaryProgressText: `${formatFixed2(primaryCurrent)} / ${formatFixed2(primaryTarget)}`,
         secondaryProgress: Number(secondaryProgress.toFixed(2)),
@@ -3795,6 +4166,20 @@ const PromoPage = {
         canSendCoupons: vip.CanSendCoupons ? "是" : "否",
         canCustomCode: vip.CanCustomCode ? "是" : "否"
       };
+    });
+    const promoAnimated = reactive({
+      totalIncome: useAnimatedNumber(computed(() => promo.value.totalIncomeRaw), (n) => (n === null ? "-" : formatFixed2(n)), { duration: 0.46 }),
+      subUserAll: useAnimatedNumber(computed(() => promo.value.subUserAllRaw), (n) => (n === null ? "-" : formatCount(n)), { duration: 0.34 }),
+      totalStockAll: useAnimatedNumber(computed(() => promo.value.totalStockAllRaw), (n) => (n === null ? "-" : formatFixed2(n)), { duration: 0.42 }),
+      totalPointsAll: useAnimatedNumber(computed(() => promo.value.totalPointsAllRaw), (n) => (n === null ? "-" : formatCount(n)), { duration: 0.4 }),
+      incomePerUser: useAnimatedNumber(computed(() => promo.value.incomePerUserRaw), (n) => (n === null ? "-" : formatFixed2(n)), { duration: 0.4 }),
+      avgAllDaily: useAnimatedNumber(computed(() => promo.value.avgAllDailyRaw), (n) => (n === null ? "-" : formatFixed2(n)), { duration: 0.4 }),
+      activeDays: useAnimatedNumber(computed(() => promo.value.activeDaysRaw), (n) => (n === null ? "-" : formatCount(n)), { duration: 0.34 }),
+      monthIncome: useAnimatedNumber(computed(() => promo.value.monthIncomeRaw), (n) => (n === null ? "-" : formatFixed2(n)), { duration: 0.46 }),
+      prevMonthIncome: useAnimatedNumber(computed(() => promo.value.prevMonthIncomeRaw), (n) => (n === null ? "-" : formatFixed2(n)), { duration: 0.46 }),
+      todayStock: useAnimatedNumber(computed(() => promo.value.todayStockRaw), (n) => (n === null ? "-" : formatCount(n)), { duration: 0.36 }),
+      monthStock: useAnimatedNumber(computed(() => promo.value.monthStockRaw), (n) => (n === null ? "-" : formatFixed2(n)), { duration: 0.4 }),
+      monthNewUser: useAnimatedNumber(computed(() => promo.value.monthNewUserRaw), (n) => (n === null ? "-" : formatCount(n)), { duration: 0.34 })
     });
     const avatar = computed(() => {
       const profile = store.userProfile || {};
@@ -4116,7 +4501,7 @@ const PromoPage = {
       await refreshSummary(false);
       syncPromoIncomeFromDetail({ force: false });
     });
-    return { avatar, promo, copyLink, openLink, shareLink, showDailyReport, dailyReport, openDailyReport, refreshDailyReport, closeDailyReport };
+    return { avatar, promo, promoAnimated, copyLink, openLink, shareLink, showDailyReport, dailyReport, openDailyReport, refreshDailyReport, closeDailyReport };
   }
 };
 
@@ -4584,14 +4969,46 @@ const RootApp = {
         return;
       }
       const shift = readNavShift();
-      animate(
+      const fromX = Number(shift.x || 0) * 1.2;
+      const fromY = (Number(shift.y || 0) * 1.2) + 18;
+      const pageAnim = animate(
         el,
         [
-          { opacity: 0.01, transform: `translate3d(${shift.x}px, ${shift.y}px, 0) scale(0.986)` },
+          { opacity: 0.001, transform: `translate3d(${fromX.toFixed(2)}px, ${fromY.toFixed(2)}px, 0) scale(0.978)` },
           { opacity: 1, transform: "translate3d(0, 0, 0) scale(1)" }
         ],
-        { duration: 0.3, easing: "cubic-bezier(.22,1,.36,1)" }
-      ).finished.then(done).catch(done);
+        { duration: 0.42, easing: "cubic-bezier(.22,1,.36,1)" }
+      ).finished;
+
+      const stagedSelectors = [
+        ".stat-cell",
+        ".todo-card",
+        ".entry",
+        ".id-card",
+        ".todo-item",
+        ".monitor-chart-item",
+        ".kv",
+        ".promo-report-row"
+      ];
+      const stagedNodes = Array.from(el.querySelectorAll(stagedSelectors.join(","))).slice(0, 36);
+      stagedNodes.forEach((node, idx) => {
+        if (!node || node.dataset.pageMotionInited === "1") return;
+        node.dataset.pageMotionInited = "1";
+        animate(
+          node,
+          [
+            { opacity: 0.001, transform: "translate3d(0, 14px, 0) scale(0.986)" },
+            { opacity: 1, transform: "translate3d(0, 0, 0) scale(1)" }
+          ],
+          {
+            duration: 0.34,
+            delay: Math.min(0.028 * idx, 0.36),
+            easing: "cubic-bezier(.22,1,.36,1)"
+          }
+        );
+      });
+
+      pageAnim.then(done).catch(done);
     };
 
     const onPageLeave = (el, done) => {
@@ -4604,9 +5021,9 @@ const RootApp = {
         el,
         [
           { opacity: 1, transform: "translate3d(0, 0, 0) scale(1)" },
-          { opacity: 0.01, transform: `translate3d(${(-0.45 * shift.x).toFixed(2)}px, ${(-0.45 * shift.y).toFixed(2)}px, 0) scale(0.994)` }
+          { opacity: 0.001, transform: `translate3d(${(-0.7 * shift.x).toFixed(2)}px, ${(10 + (-0.7 * shift.y)).toFixed(2)}px, 0) scale(0.986)` }
         ],
-        { duration: 0.14, easing: "ease-out" }
+        { duration: 0.2, easing: "cubic-bezier(.4,0,.2,1)" }
       ).finished.then(done).catch(done);
     };
 
@@ -4627,17 +5044,34 @@ const RootApp = {
         return;
       }
       const panel = el.querySelector(".app-dialog");
-      const fade = animate(el, [{ opacity: 0 }, { opacity: 1 }], { duration: 0.18, easing: "ease-out" }).finished;
+      const fade = animate(el, [{ opacity: 0 }, { opacity: 1 }], { duration: 0.24, easing: "ease-out" }).finished;
       const pop = panel
         ? animate(
           panel,
           [
-            { opacity: 0, transform: "translate3d(0, 12px, 0) scale(0.97)" },
+            { opacity: 0, transform: "translate3d(0, 24px, 0) scale(0.94)" },
             { opacity: 1, transform: "translate3d(0, 0, 0) scale(1)" }
           ],
-          { duration: 0.24, easing: "cubic-bezier(.22,1,.36,1)" }
+          { duration: 0.32, easing: "cubic-bezier(.22,1,.36,1)" }
         ).finished
         : Promise.resolve();
+      if (panel) {
+        const parts = Array.from(panel.querySelectorAll(".app-dialog-head, .app-dialog-body, .app-dialog-actions"));
+        parts.forEach((part, idx) => {
+          animate(
+            part,
+            [
+              { opacity: 0.001, transform: "translate3d(0, 8px, 0)" },
+              { opacity: 1, transform: "translate3d(0, 0, 0)" }
+            ],
+            {
+              duration: 0.26,
+              delay: 0.03 + (idx * 0.028),
+              easing: "cubic-bezier(.22,1,.36,1)"
+            }
+          );
+        });
+      }
       Promise.all([fade, pop]).then(() => {
         const input = el.querySelector(".app-dialog-input");
         if (input && typeof input.focus === "function") {
@@ -4655,15 +5089,15 @@ const RootApp = {
         return;
       }
       const panel = el.querySelector(".app-dialog");
-      const fade = animate(el, [{ opacity: 1 }, { opacity: 0 }], { duration: 0.15, easing: "ease-out" }).finished;
+      const fade = animate(el, [{ opacity: 1 }, { opacity: 0 }], { duration: 0.2, easing: "ease-out" }).finished;
       const pop = panel
         ? animate(
           panel,
           [
             { opacity: 1, transform: "translate3d(0, 0, 0) scale(1)" },
-            { opacity: 0, transform: "translate3d(0, 8px, 0) scale(0.985)" }
+            { opacity: 0, transform: "translate3d(0, 14px, 0) scale(0.972)" }
           ],
-          { duration: 0.15, easing: "ease-out" }
+          { duration: 0.2, easing: "cubic-bezier(.4,0,.2,1)" }
         ).finished
         : Promise.resolve();
       Promise.all([fade, pop]).then(done).catch(done);
