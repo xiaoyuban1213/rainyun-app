@@ -1,11 +1,18 @@
 {
-  "version": "1.1.7",
-  "downloadUrl": "http://ros.yuban.cloud/app/RainYun-App-v1.1.7-release.apk",
-  "notes": "1. 基本实现游戏云（RGS）的实际操作，暂不支持雨云面板。\n2. 优化了详情页布局。",
-  "sha256": "561DACFC0D26B0864CD03A6EDB4FDADB8B6ABA9D36B3199A98A9747EBCE2B358",
-  "buildTime": "2026-03-06T07:21:17+08:00",
+  "version": "1.1.8",
+  "downloadUrl": "http://ros.yuban.cloud/app/RainYun-App-v1.1.8-release.apk",
+  "notes": "1. 修复游戏云部分已知问题。\n2. 支持多账号登录，切换，编辑。",
+  "sha256": "1CE2BCBDBE616429D6AF755E2024CD2F6144923C962925CD087F1496D11BEC37",
+  "buildTime": "2026-03-06T09:33:08+08:00",
   "force": false,
   "history": [
+    {
+      "version": "1.1.8",
+      "notes": "1. 修复游戏云部分已知问题。\n2. 支持多账号登录，切换，编辑。",
+      "buildTime": "2026-03-06T09:33:08+08:00",
+      "downloadUrl": "http://ros.yuban.cloud/app/RainYun-App-v1.1.8-release.apk",
+      "sha256": "1CE2BCBDBE616429D6AF755E2024CD2F6144923C962925CD087F1496D11BEC37"
+    },
     {
       "version": "1.1.7",
       "notes": "1. 基本实现游戏云（RGS）的实际操作，暂不支持雨云面板。\n2. 优化了详情页布局。",

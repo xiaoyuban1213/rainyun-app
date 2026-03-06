@@ -13,7 +13,7 @@ import "@arco-design/web-vue/es/typography/style/css.js";
 
 const BRAND_LOGO = new URL("./assets/icons/app-icon-20260228.jpg", import.meta.url).href;
 const AVATAR = new URL("./assets/images/default-avatar.svg", import.meta.url).href;
-const APP_VERSION = "1.1.7";
+const APP_VERSION = "1.1.8";
 const SEASON_BG_MAP = {
   spring: "https://forum.rainyun.com/uploads/default/original/2X/c/c945ac6e94feae902f54476fd53c65cc74d027fb.webp",
   summer: "https://forum.rainyun.com/uploads/default/original/2X/b/b89be1c923371d70912118bc3038cee6f1f77f0f.webp",
@@ -105,6 +105,7 @@ function applySeasonBackground() {
 
 const store = reactive({
   auth: loadAuth(),
+  authAccounts: loadAuthAccounts(),
   loading: false,
   summary: { domain: [], rca: [], rcs: [], rgpu: [], rgs: [], ssl_order: [] },
   renewDueCount: 0,
@@ -132,6 +133,7 @@ const RENEW_ROWS_TTL_MS = 60 * 1000;
 const RENEW_PRICE_TTL_MS = 2 * 60 * 1000;
 const COUPON_TTL_MS = 60 * 1000;
 const API_REQUEST_CACHE_KEY = "rainyun-api-request-cache";
+const AUTH_ACCOUNTS_STORAGE_KEY = "rainyun-auth-accounts";
 const PROMO_DAILY_CACHE_KEY = "rainyun-promo-income-daily-cache";
 const PROMO_RESELL_DETAIL_CACHE_KEY = "rainyun-promo-resell-detail-cache";
 const USER_AVATAR_CACHE_KEY = "rainyun-user-avatar-url";
@@ -181,6 +183,11 @@ const appDialogState = reactive({
   _resolver: null
 });
 const appDialogQueue = [];
+const appWaitState = reactive({
+  visible: false,
+  title: "请稍候",
+  message: ""
+});
 
 function pumpAppDialogQueue() {
   if (appDialogState.visible) return;
@@ -248,6 +255,18 @@ async function appPrompt(title, value = "", options = {}) {
   };
 }
 
+function showAppWait(message, title = "请稍候") {
+  appWaitState.title = String(title || "请稍候");
+  appWaitState.message = String(message || "");
+  appWaitState.visible = true;
+}
+
+function hideAppWait() {
+  appWaitState.visible = false;
+  appWaitState.title = "请稍候";
+  appWaitState.message = "";
+}
+
 function reportLog(level, event, detail = {}) {
   if (typeof console === "undefined") return;
   const payload = { level, event, detail, at: new Date().toISOString() };
@@ -260,14 +279,74 @@ function reportLog(level, event, detail = {}) {
   }
 }
 
-function loadAuth() {
-  const defaultAuth = {
+function createDefaultAuth() {
+  return {
     baseUrl: "https://api.v2.rainyun.com",
     apiKey: "",
     devToken: "",
     authMode: "apiKey",
-    account: ""
+    account: "",
+    savedId: ""
   };
+}
+
+function normalizeAuthRecord(raw = {}) {
+  const next = raw && typeof raw === "object" ? raw : {};
+  return {
+    id: String(next.id || "").trim(),
+    baseUrl: String(next.baseUrl || "https://api.v2.rainyun.com").trim() || "https://api.v2.rainyun.com",
+    apiKey: String(next.apiKey || "").trim(),
+    devToken: String(next.devToken || "").trim(),
+    authMode: next.authMode === "account" ? "account" : "apiKey",
+    account: String(next.account || "").trim(),
+    label: String(next.label || "").trim(),
+    userId: String(next.userId || "").trim(),
+    avatarUrl: String(next.avatarUrl || "").trim(),
+    updatedAt: Number(next.updatedAt || 0) || 0
+  };
+}
+
+function makeSavedAuthId() {
+  return `auth_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function maskApiKey(raw) {
+  const text = String(raw || "").trim();
+  if (!text) return "-";
+  if (text.length <= 8) return `${text.slice(0, 2)}***${text.slice(-2)}`;
+  return `${text.slice(0, 3)}***${text.slice(-3)}`;
+}
+
+function loadAuthAccounts() {
+  try {
+    const raw = localStorage.getItem("rainyun-auth-accounts");
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .map((item) => normalizeAuthRecord(item))
+      .filter((item) => item.id && (item.apiKey || item.devToken));
+  } catch {
+    return [];
+  }
+}
+
+function persistAuthAccounts(list) {
+  const rows = Array.isArray(list)
+    ? list.map((item) => normalizeAuthRecord(item)).filter((item) => item.id && (item.apiKey || item.devToken))
+    : [];
+  try {
+    localStorage.setItem(AUTH_ACCOUNTS_STORAGE_KEY, JSON.stringify(rows));
+  } catch {
+    // ignore storage errors
+  }
+  if (typeof store !== "undefined" && store && Array.isArray(store.authAccounts)) {
+    store.authAccounts = rows;
+  }
+}
+
+function loadAuth() {
+  const defaultAuth = createDefaultAuth();
   try {
     const raw = localStorage.getItem("rainyun-auth");
     if (!raw) return defaultAuth;
@@ -277,7 +356,8 @@ function loadAuth() {
       apiKey: v.apiKey || "",
       devToken: v.devToken || "",
       authMode: v.authMode === "account" ? "account" : "apiKey",
-      account: v.account || ""
+      account: v.account || "",
+      savedId: v.savedId || ""
     };
   } catch {
     return defaultAuth;
@@ -286,7 +366,7 @@ function loadAuth() {
 
 function loadCachedAvatarUrl() {
   try {
-    return String(localStorage.getItem(USER_AVATAR_CACHE_KEY) || "").trim();
+    return String(localStorage.getItem("rainyun-user-avatar-url") || "").trim();
   } catch {
     return "";
   }
@@ -311,7 +391,8 @@ function saveAuth(nextAuth) {
     apiKey: (nextAuth.apiKey || "").trim(),
     devToken: (nextAuth.devToken || "").trim(),
     authMode: nextAuth.authMode === "account" ? "account" : "apiKey",
-    account: (nextAuth.account || "").trim()
+    account: (nextAuth.account || "").trim(),
+    savedId: (nextAuth.savedId || "").trim()
   };
   localStorage.setItem("rainyun-auth", JSON.stringify(store.auth));
   if (!isAuthenticated()) {
@@ -335,6 +416,71 @@ function saveAuth(nextAuth) {
   store.userCoupons = [];
   store.userCouponsAt = 0;
   reportLog("INFO", "auth_saved", { hasApiKey: Boolean(store.auth.apiKey), hasDevToken: Boolean(store.auth.devToken) });
+}
+
+function buildSavedAuthLabel(profile, fallback = {}) {
+  const data = profile && typeof profile === "object" ? profile : {};
+  const nextFallback = fallback && typeof fallback === "object" ? fallback : {};
+  const name = String(
+    pickFirstFieldDeep(data, ["Name", "nickname", "username", "name", "user_name"]) ||
+    nextFallback.label ||
+    ""
+  ).trim();
+  const uid = String(
+    pickFirstFieldDeep(data, ["ID", "uid", "id", "user_id"]) ||
+    nextFallback.userId ||
+    ""
+  ).trim();
+  if (name && uid) return `${name} · ${uid}`;
+  if (name) return name;
+  if (uid) return `账号 ${uid}`;
+  return maskApiKey(nextFallback.apiKey || "");
+}
+
+function upsertSavedAuthAccount({ auth, profile, avatarUrl } = {}) {
+  const sourceAuth = normalizeAuthRecord(auth || store.auth || {});
+  if (!sourceAuth.apiKey && !sourceAuth.devToken) return;
+  const list = loadAuthAccounts();
+  const currentId = String(sourceAuth.id || sourceAuth.savedId || store.auth.savedId || "").trim();
+  const matchIndex = list.findIndex((item) => (
+    (currentId && item.id === currentId)
+    || (item.baseUrl === sourceAuth.baseUrl && item.apiKey === sourceAuth.apiKey && item.devToken === sourceAuth.devToken)
+  ));
+  const existing = matchIndex >= 0 ? list[matchIndex] : null;
+  const id = existing?.id || currentId || makeSavedAuthId();
+  const next = normalizeAuthRecord({
+    ...existing,
+    ...sourceAuth,
+    id,
+    label: buildSavedAuthLabel(profile, { ...(existing || {}), ...sourceAuth }),
+    userId: String(pickFirstFieldDeep(profile || {}, ["ID", "uid", "id", "user_id"]) || existing?.userId || "").trim(),
+    avatarUrl: String(
+      avatarUrl
+      || pickFirstFieldDeep(profile || {}, ["IconUrl", "iconUrl", "icon_url", "avatar", "avatar_url", "headimgurl", "head_img", "face"])
+      || existing?.avatarUrl
+      || ""
+    ).trim(),
+    updatedAt: Date.now()
+  });
+  if (matchIndex >= 0) list.splice(matchIndex, 1, next);
+  else list.unshift(next);
+  persistAuthAccounts(list);
+  if (store.auth.savedId !== id) {
+    saveAuth({ ...store.auth, savedId: id });
+  }
+}
+
+function removeSavedAuthAccount(savedId) {
+  const targetId = String(savedId || "").trim();
+  if (!targetId) return;
+  const next = loadAuthAccounts().filter((item) => item.id !== targetId);
+  persistAuthAccounts(next);
+  if (String(store.auth.savedId || "") === targetId) {
+    saveAuth(createDefaultAuth());
+    store.userProfile = null;
+    store.rawSummary = null;
+    store.summary = { domain: [], rca: [], rcs: [], rgpu: [], rgs: [], ssl_order: [] };
+  }
 }
 
 function clamp(n, min, max) {
@@ -1690,6 +1836,13 @@ async function refreshSummary(force = false) {
           store.cachedAvatarUrl = profileAvatar;
           saveCachedAvatarUrl(profileAvatar);
         }
+        if (isAuthenticated()) {
+          upsertSavedAuthAccount({
+            auth: store.auth,
+            profile: store.userProfile,
+            avatarUrl: profileAvatar
+          });
+        }
       } else {
         reportLog("WARN", "user_profile_load_error", { error: String(userRes.reason) });
       }
@@ -1974,6 +2127,23 @@ function getRgsMcsmAccessHost(dataRoot) {
   return String(d.NatPublicDomain || d.NATSpareDomain || d.NatPublicIP || "-").trim() || "-";
 }
 
+function getRgsNatEndpoint(detailEnvelope, dataRoot) {
+  const d = dataRoot && typeof dataRoot === "object" ? dataRoot : {};
+  const natList = Array.isArray(detailEnvelope?.NatList) ? detailEnvelope.NatList : (Array.isArray(d.NatList) ? d.NatList : []);
+  const host = String(d.NatPublicDomain || d.NATSpareDomain || d.NatPublicIP || "").trim();
+  const firstPort = natList
+    .map((item) => String(item?.PortOut || "").trim())
+    .find(Boolean);
+  if (!host) return "-";
+  return firstPort ? `${host}:${firstPort}` : host;
+}
+
+function getRgsAddressLabel({ isMcsm = false, ipModeLabel = "" } = {}) {
+  if (isMcsm) return "管理面板";
+  if (String(ipModeLabel || "").includes("NAT")) return "远程连接地址";
+  return "公网 IP 地址";
+}
+
 const RGS_MCSM_PASSWORD_SUFFIX = "Ry6!";
 
 function normalizeRgsMcsmPassword(value) {
@@ -2120,8 +2290,8 @@ function buildDetailView(kind, id, detailData, monitorData, options = {}) {
       { key: "CPU", value: `${String(d.CPU ?? plan.cpu ?? "-")} 核` },
       { key: "内存", value: `${String(d.Memory ?? plan.memory ?? "-")} MB` },
       { key: "系统盘", value: `${String(d.Disk ?? "-")} GB` },
-      { key: "上行带宽", value: `${String(d.NetIn ?? plan.net_in ?? "-")} Mbps` },
-      { key: "下行带宽", value: `${String(d.NetOut ?? plan.net_out ?? "-")} Mbps` },
+      { key: "上行带宽", value: `${String(d.NetOut ?? plan.net_out ?? "-")} Mbps` },
+      { key: "下行带宽", value: `${String(d.NetIn ?? plan.net_in ?? "-")} Mbps` },
       { key: "系统", value: d.OsInfo?.chinese_name || d.OsName || "-" }
     ];
     const memoryPercent = usage.FreeMem !== undefined && usage.MaxMem !== undefined && Number(usage.MaxMem) > 0
@@ -2238,6 +2408,7 @@ function buildDetailView(kind, id, detailData, monitorData, options = {}) {
     const usage = d.UsageData || d.usage_data || d.usage || {};
     const natList = Array.isArray(detailEnvelope.NatList) ? detailEnvelope.NatList : (Array.isArray(d.NatList) ? d.NatList : []);
     const showIp = pickRgsKvmAddress(detailEnvelope, d);
+    const natEndpoint = getRgsNatEndpoint(detailEnvelope, d);
     const subtype = getRgsSubtype(detailEnvelope, d);
     const isMcsm = subtype.includes("mcsm");
     const isK8sPanel = subtype.includes("k8s_panel");
@@ -2281,7 +2452,10 @@ function buildDetailView(kind, id, detailData, monitorData, options = {}) {
       { key: "服务类型", value: serviceTypeLabel },
       { key: "IP类型", value: ipModeLabel },
       { key: "计费模式", value: chargeTypeLabel },
-      { key: isMcsm ? "接入地址" : "公网IP", value: isMcsm ? accessHost : showIp },
+      {
+        key: isMcsm ? "接入地址" : (ipModeLabel.includes("NAT") ? "远程连接地址" : "公网IP"),
+        value: isMcsm ? accessHost : (ipModeLabel.includes("NAT") ? natEndpoint : showIp)
+      },
       { key: "配置", value: plan.chinese || plan.plan_name || d.PlanName || d.Spec || "-" },
       { key: "到期时间", value: gameExpireAt }
     ];
@@ -2289,8 +2463,8 @@ function buildDetailView(kind, id, detailData, monitorData, options = {}) {
       { key: "CPU", value: `${String(d.CPU ?? plan.cpu ?? "-")} 核` },
       { key: "内存", value: `${String(d.Memory ?? plan.memory ?? "-")} GB` },
       { key: "系统盘", value: `${String(d.BaseDisk ?? d.Disk ?? plan.base_disk ?? plan.disk ?? "-")} GB` },
-      { key: "上行带宽", value: `${String(d.NetIn ?? plan.net_in ?? "-")} Mbps` },
-      { key: "下行带宽", value: `${String(d.NetOut ?? plan.net_out ?? "-")} Mbps` }
+      { key: "上行带宽", value: `${String(d.NetOut ?? plan.net_out ?? "-")} Mbps` },
+      { key: "下行带宽", value: `${String(d.NetIn ?? plan.net_in ?? "-")} Mbps` }
     ];
     const configRows = isMcsm
       ? [
@@ -2351,10 +2525,14 @@ function buildDetailView(kind, id, detailData, monitorData, options = {}) {
       isKvm,
       isMcsm,
       isK8sPanel,
-      addressLabel: isMcsm ? "管理面板" : "公网 IP 地址",
+      addressLabel: getRgsAddressLabel({ isMcsm, ipModeLabel }),
       userLabel: isMcsm ? "面板用户名" : "远程用户名",
       passwordLabel: isMcsm ? "面板密码" : "远程密码",
-      remoteIp: isMcsm ? String(accessHost || "") : (showIp === "-" ? "" : String(showIp)),
+      remoteIp: isMcsm
+        ? String(accessHost || "")
+        : (ipModeLabel.includes("NAT")
+          ? (natEndpoint === "-" ? "" : String(natEndpoint))
+          : (showIp === "-" ? "" : String(showIp))),
       remoteUser: isMcsm ? panelUser : remoteUser,
       remotePassword: isMcsm ? panelPassword : remotePassword,
       panelUrl: mcsmPanelUrl,
@@ -2462,8 +2640,8 @@ function buildDetailView(kind, id, detailData, monitorData, options = {}) {
 
 const MobileShell = {
   template: `
-    <div class="mobile-app" @touchstart.passive="onTouchStart" @touchmove.passive="onTouchMove" @touchend="onTouchEnd">
-      <header class="m-header">
+    <div ref="appRef" class="mobile-app" @touchstart.passive="onTouchStart" @touchmove.passive="onTouchMove" @touchend="onTouchEnd">
+      <header ref="headerRef" class="m-header">
         <img :src="logo" alt="logo" />
         <div class="m-header-main">
           <h1>雨云 App</h1>
@@ -2475,9 +2653,9 @@ const MobileShell = {
         </button>
       </header>
 
-      <main :class="mainClass"><slot /></main>
+      <main ref="mainRef" :class="mainClass"><slot /></main>
 
-      <nav class="m-tabbar">
+      <nav ref="tabbarRef" class="m-tabbar">
         <button :class="tabClass('/home')" @click="go('/home')"><i class="fa-solid fa-house"></i><span>主页</span></button>
         <button :class="tabClass('/promo')" @click="go('/promo')"><i class="fa-solid fa-bullhorn"></i><span>推广中心</span></button>
         <button :class="tabClass(isAuthed ? '/me' : '/login')" @click="go(isAuthed ? '/me' : '/login')"><i class="fa-solid fa-user"></i><span>我的</span></button>
@@ -2488,6 +2666,11 @@ const MobileShell = {
   setup() {
     const router = useRouter();
     const route = useRoute();
+    const appRef = ref(null);
+    const headerRef = ref(null);
+    const mainRef = ref(null);
+    const tabbarRef = ref(null);
+    let shellResizeObserver = null;
     const isAuthed = computed(() => isAuthenticated());
     const showAccountBtn = computed(() => {
       const p = String(route.path || "");
@@ -2553,9 +2736,28 @@ const MobileShell = {
     const mainClass = computed(() => {
       const classes = ["m-main"];
       if (route.path === "/home") classes.push("m-main-home");
+      if (route.path === "/login") classes.push("m-main-login");
       if (/^\/product\/[^/]+\/[^/]+$/.test(String(route.path || ""))) classes.push("m-main-detail");
       return classes;
     });
+    const resetMainScroll = () => {
+      const el = mainRef.value;
+      if (!el) return;
+      if (typeof el.scrollTo === "function") {
+        el.scrollTo({ top: 0, left: 0, behavior: "auto" });
+        return;
+      }
+      el.scrollTop = 0;
+      el.scrollLeft = 0;
+    };
+    const syncShellMetrics = () => {
+      const appEl = appRef.value;
+      if (!appEl) return;
+      const headerHeight = Math.round(headerRef.value?.getBoundingClientRect?.().height || 0);
+      const tabbarHeight = Math.round(tabbarRef.value?.getBoundingClientRect?.().height || 0);
+      appEl.style.setProperty("--shell-header-height", `${headerHeight || 60}px`);
+      appEl.style.setProperty("--shell-tabbar-height", `${tabbarHeight || 68}px`);
+    };
     const avatar = computed(() => {
       const profile = store.userProfile || {};
       const fromProfile = normalizeAssetUrl(
@@ -2573,6 +2775,18 @@ const MobileShell = {
       return fromCache || AVATAR;
     });
     onMounted(() => {
+      nextTick(() => {
+        requestAnimationFrame(() => {
+          syncShellMetrics();
+          resetMainScroll();
+        });
+      });
+      if (typeof ResizeObserver !== "undefined") {
+        shellResizeObserver = new ResizeObserver(() => syncShellMetrics());
+        if (headerRef.value) shellResizeObserver.observe(headerRef.value);
+        if (tabbarRef.value) shellResizeObserver.observe(tabbarRef.value);
+        if (appRef.value) shellResizeObserver.observe(appRef.value);
+      }
       if (!isAuthed.value) return;
       if (store.userProfile) return;
       apiGet("/user/", { ttlMs: API_TTL_META_MS })
@@ -2591,7 +2805,21 @@ const MobileShell = {
           // keep local avatar cache fallback
         });
     });
-    return { go, goAccount, tabClass, mainClass, logo: BRAND_LOGO, onTouchStart, onTouchMove, onTouchEnd, isAuthed, avatar, showAccountBtn };
+    watch(() => route.fullPath, () => {
+      nextTick(() => {
+        requestAnimationFrame(() => {
+          syncShellMetrics();
+          resetMainScroll();
+        });
+      });
+    });
+    onUnmounted(() => {
+      if (shellResizeObserver) {
+        shellResizeObserver.disconnect();
+        shellResizeObserver = null;
+      }
+    });
+    return { go, goAccount, tabClass, mainClass, logo: BRAND_LOGO, onTouchStart, onTouchMove, onTouchEnd, isAuthed, avatar, showAccountBtn, mainRef, appRef, headerRef, tabbarRef };
   }
 };
 
@@ -3160,13 +3388,18 @@ const ProductListPage = {
       const memPercent = toNumberOrNull(memRow?.percent) ?? parseMemPercent(memText) ?? 0;
       const detailRoot = detailData && detailData.Data && typeof detailData.Data === "object" ? detailData.Data : detailData;
       const isMcsm = Boolean(info.isMcsm);
-      const directAddress = isMcsm ? getRgsMcsmAccessHost(detailRoot) : pickRgsKvmAddress(detailData, detailRoot);
+      const ipModeText = String(info.ipMode || "");
+      const directAddress = isMcsm
+        ? getRgsMcsmAccessHost(detailRoot)
+        : (ipModeText.includes("NAT")
+          ? getRgsNatEndpoint(detailData, detailRoot)
+          : pickRgsKvmAddress(detailData, detailRoot));
       const fallbackAddress = String(info.remoteIp || "-");
       return {
         statusText: status.statusText,
         statusClass: status.statusClass,
         nodeText: String(info.node || "-"),
-        addressLabel: isMcsm ? "接入" : "IP",
+        addressLabel: isMcsm ? "接入" : (ipModeText.includes("NAT") ? "地址" : "IP"),
         addressText: formatCardAddress(directAddress && directAddress !== "-" ? directAddress : fallbackAddress),
         expireText: parseExpireBrief(String(info.expireAt || "-")),
         cpuText,
@@ -5005,13 +5238,13 @@ const LoginPage = {
         <div class="login-hero-head">
           <div class="login-hero-icon"><i class="fa-solid fa-shield-halved"></i></div>
           <div class="login-hero-main">
-            <a-typography-title :heading="5" class="typo-title">{{ isEditMode ? '编辑 API Key' : '使用 API Key 登录 RainYun App' }}</a-typography-title>
+            <a-typography-title :heading="5" class="typo-title">{{ loginHeroTitle }}</a-typography-title>
             <a-typography-text class="panel-subtext" type="secondary">
-              {{ isEditMode ? '修改后将立即重新同步账号数据。' : '输入 API Key，快速连接你的 RainYun 账号。' }}
+              {{ loginHeroDesc }}
             </a-typography-text>
           </div>
         </div>
-        <div class="login-badges" v-if="!isEditMode">
+        <div class="login-badges" v-if="!isEditingSavedAccount">
           <span><i class="fa-solid fa-bolt"></i> 快速接入</span>
           <span><i class="fa-solid fa-lock"></i> 本地存储</span>
           <span><i class="fa-solid fa-arrows-rotate"></i> 一键同步</span>
@@ -5021,8 +5254,8 @@ const LoginPage = {
 
       <section class="panel login-panel">
         <div class="login-form-head">
-          <a-typography-title :heading="6" class="typo-title">{{ isEditMode ? '更新凭证' : '开始使用' }}</a-typography-title>
-          <a-typography-text class="panel-subtext" type="secondary">请输入 RainYun 控制台生成的 API Key</a-typography-text>
+          <a-typography-title :heading="6" class="typo-title">{{ loginPanelTitle }}</a-typography-title>
+          <a-typography-text class="panel-subtext" type="secondary">{{ loginPanelDesc }}</a-typography-text>
         </div>
         <div class="form-grid">
           <label>API Key
@@ -5031,28 +5264,55 @@ const LoginPage = {
         </div>
         <a-typography-text class="muted login-tip" type="secondary">不会上传到第三方服务器，仅用于本地请求 RainYun API。</a-typography-text>
         <div class="btn-row">
-          <a-button class="primary-btn" type="primary" :loading="loading" @click="submitLogin">{{ isEditMode ? '更新并同步' : '保存并同步' }}</a-button>
+          <a-button class="primary-btn" type="primary" :loading="loading" @click="submitLogin">{{ loginSubmitText }}</a-button>
         </div>
       </section>
 
-      <section class="panel login-help" v-if="!isEditMode">
-        <div class="login-help-head">
-          <a-typography-title :heading="6" class="typo-title">获取与使用</a-typography-title>
+      <section class="panel login-saved" v-if="savedAccounts.length">
+        <div class="panel-title">
+          <a-typography-title :heading="6" class="typo-title">已保存账号</a-typography-title>
+          <a-typography-text class="panel-subtext" type="secondary">支持一键切换当前 API Key</a-typography-text>
+        </div>
+        <div class="saved-auth-list">
+          <div class="saved-auth-item" v-for="item in savedAccounts" :key="item.id" :class="{ 'is-active': item.isActive }">
+            <div class="saved-auth-main">
+              <b>{{ item.label }}</b>
+              <span>{{ item.masked }}</span>
+            </div>
+            <div class="saved-auth-actions">
+              <a-button class="line-btn sm" size="small" type="outline" :disabled="item.isActive || loading" @click="switchAccount(item.id)">
+                {{ item.isActive ? '当前账号' : '登录此账号' }}
+              </a-button>
+              <a-button class="line-btn sm" size="small" type="outline" status="danger" :disabled="loading" @click="removeAccount(item.id)">
+                删除
+              </a-button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel login-help" v-if="!isEditingSavedAccount">
+        <div class="panel-title login-help-title">
+          <div class="login-help-title-main">
+            <a-typography-title :heading="6" class="typo-title">获取与使用</a-typography-title>
+            <a-typography-text class="panel-subtext login-help-subtext" type="secondary">在 RainYun 控制台创建 API Key 后，复制并粘贴到上方输入框即可。</a-typography-text>
+          </div>
           <a-button class="line-btn sm login-guide-btn" size="small" type="outline" @click="openApiKeyGuide">前往API密钥页面</a-button>
         </div>
-        <div class="login-help-note">在 RainYun 控制台创建 API Key 后，复制并粘贴到上方输入框即可。</div>
-        <details class="login-faq-item">
-          <summary>API Key 在哪里创建？</summary>
-          <p>进入 RainYun 控制台账号相关页面，进入 API密钥 页面，并复制。</p>
-        </details>
-        <details class="login-faq-item">
-          <summary>提示认证失败怎么办？</summary>
-          <p>先确认 Key 是否完整复制、是否已过期，再重新生成后重试。</p>
-        </details>
-        <details class="login-faq-item">
-          <summary>会上传到其他服务器吗？</summary>
-          <p>不会。应用仅在本地保存并直接请求 RainYun API。</p>
-        </details>
+        <div class="login-help-faq">
+          <details class="login-faq-item">
+            <summary>API Key 在哪里创建？</summary>
+            <p>进入 RainYun 控制台账号相关页面，进入 API密钥 页面，并复制。</p>
+          </details>
+          <details class="login-faq-item">
+            <summary>提示认证失败怎么办？</summary>
+            <p>先确认 Key 是否完整复制、是否已过期，再重新生成后重试。</p>
+          </details>
+          <details class="login-faq-item">
+            <summary>会上传到其他服务器吗？</summary>
+            <p>不会。应用仅在本地保存并直接请求 RainYun API。</p>
+          </details>
+        </div>
       </section>
     </MobileShell>
   `,
@@ -5061,9 +5321,59 @@ const LoginPage = {
     const route = useRoute();
     const loading = ref(false);
     const isEditMode = computed(() => String(route.query?.edit || "") === "1");
-    const form = reactive({
-      apiKey: store.auth.apiKey || ""
+    const editingSavedId = computed(() => String(route.query?.savedId || "").trim());
+    const savedAccounts = computed(() => (Array.isArray(store.authAccounts) ? store.authAccounts : []).map((item) => ({
+      id: item.id,
+      label: item.label || buildSavedAuthLabel({}, item),
+      masked: maskApiKey(item.apiKey),
+      isActive: item.id && item.id === String(store.auth.savedId || "").trim()
+    })));
+    const hasSavedAccounts = computed(() => savedAccounts.value.length > 0);
+    const editingSavedAccount = computed(() => (store.authAccounts || []).find((item) => item.id === editingSavedId.value) || null);
+    const isEditingSavedAccount = computed(() => Boolean(editingSavedAccount.value));
+    const isAddingSavedAccount = computed(() => (hasSavedAccounts.value && !isEditingSavedAccount.value) || (isEditMode.value && !isEditingSavedAccount.value));
+    const loginHeroTitle = computed(() => {
+      if (isEditingSavedAccount.value) return "编辑已保存账号";
+      if (isAddingSavedAccount.value) return "新增 API Key 账号";
+      return "使用 API Key 登录 RainYun App";
     });
+    const loginHeroDesc = computed(() => {
+      if (isEditingSavedAccount.value) return "修改后会覆盖该已保存账号的 API Key，并立即同步最新账号数据。";
+      if (isAddingSavedAccount.value) return "输入新的 API Key，可额外保存一个账号，后续可快速切换。";
+      return "输入 API Key，快速连接你的 RainYun 账号。";
+    });
+    const loginPanelTitle = computed(() => {
+      if (isEditingSavedAccount.value) return "编辑账号";
+      if (isAddingSavedAccount.value) return "新增账号";
+      if (isEditMode.value) return "更新凭证";
+      return "开始使用";
+    });
+    const loginPanelDesc = computed(() => {
+      if (isEditingSavedAccount.value) return "正在编辑已保存账号，保存后将覆盖该账号的 API Key。";
+      if (isAddingSavedAccount.value) return "检测到你已有保存账号，输入新的 API Key 后将新增一个账号。";
+      return "请输入 RainYun 控制台生成的 API Key";
+    });
+    const loginSubmitText = computed(() => {
+      if (isEditingSavedAccount.value) return "保存修改";
+      if (isAddingSavedAccount.value) return "新增并同步";
+      if (isEditMode.value) return "更新并同步";
+      return "保存并同步";
+    });
+    const form = reactive({
+      apiKey: ""
+    });
+
+    const syncLoginForm = () => {
+      if (isEditingSavedAccount.value) {
+        form.apiKey = String(editingSavedAccount.value?.apiKey || "");
+        return;
+      }
+      if (isAddingSavedAccount.value) {
+        form.apiKey = "";
+        return;
+      }
+      form.apiKey = store.auth.apiKey || "";
+    };
 
     async function submitLogin() {
       const apiKey = String(form.apiKey || "").trim();
@@ -5075,15 +5385,27 @@ const LoginPage = {
       loading.value = true;
       try {
         await validateAuth(baseUrl, apiKey, "");
+        const nextSavedId = isEditingSavedAccount.value
+          ? String(editingSavedAccount.value?.id || "")
+          : (isEditMode.value && apiKey === String(store.auth.apiKey || "").trim()
+            ? String(store.auth.savedId || "").trim()
+            : "");
         saveAuth({
           baseUrl,
           apiKey,
           devToken: "",
           authMode: "apiKey",
-          account: ""
+          account: "",
+          savedId: nextSavedId
         });
         await refreshSummary(true);
-        if (isEditMode.value) {
+        if (isEditingSavedAccount.value) {
+          toast("账号已更新");
+          router.replace("/home");
+        } else if (isAddingSavedAccount.value) {
+          toast("账号已新增");
+          router.replace("/home");
+        } else if (isEditMode.value) {
           toast("API Key 已更新");
           router.replace("/me");
         } else {
@@ -5097,15 +5419,65 @@ const LoginPage = {
       }
     }
 
+    function editAccount(savedId) {
+      const target = (store.authAccounts || []).find((item) => item.id === savedId);
+      if (!target) {
+        toast("未找到该账号");
+        return;
+      }
+      router.push({ path: "/login", query: { edit: "1", savedId: target.id } });
+    }
+
+    async function switchAccount(savedId) {
+      const target = (store.authAccounts || []).find((item) => item.id === savedId);
+      if (!target) {
+        toast("未找到该账号");
+        return;
+      }
+      loading.value = true;
+      showAppWait("账号切换中，请您耐心等待。", "账号切换");
+      try {
+        saveAuth({
+          ...target,
+          savedId: target.id
+        });
+        await refreshSummary(true);
+        toast(`已切换到 ${target.label || maskApiKey(target.apiKey)}`);
+        router.replace("/home");
+      } catch (e) {
+        toast(`切换失败：${String(e || "")}`);
+      } finally {
+        hideAppWait();
+        loading.value = false;
+      }
+    }
+
+    async function removeAccount(savedId) {
+      const target = (store.authAccounts || []).find((item) => item.id === savedId);
+      if (!target) return;
+      const ok = await appConfirm(
+        `确认删除已保存账号“${target.label || maskApiKey(target.apiKey)}”？`,
+        { title: "删除账号", confirmText: "删除", cancelText: "取消" }
+      );
+      if (!ok) return;
+      removeSavedAuthAccount(savedId);
+      toast("已删除保存的账号");
+      if (!isAuthenticated()) {
+        form.apiKey = "";
+      }
+    }
+
     onMounted(() => {
+      syncLoginForm();
       if (isAuthenticated() && !isEditMode.value) router.replace("/home");
     });
+    watch([isEditMode, editingSavedId, savedAccounts], () => syncLoginForm(), { immediate: true });
 
     const openApiKeyGuide = () => {
       window.open("https://app.rainyun.com/account/settings/api-key", "_blank");
     };
 
-    return { form, loading, submitLogin, isEditMode, openApiKeyGuide };
+    return { form, loading, submitLogin, isEditMode, isEditingSavedAccount, openApiKeyGuide, savedAccounts, switchAccount, editAccount, removeAccount, loginPanelTitle, loginPanelDesc, loginSubmitText, loginHeroTitle, loginHeroDesc };
   }
 };
 
@@ -5140,12 +5512,31 @@ const MePage = {
         <div class="panel-title"><a-typography-title :heading="6" class="typo-title">账号中心</a-typography-title></div>
         <div class="kv"><span>认证方式</span><b>{{ authInfo.modeText }}</b></div>
         <div class="kv"><span>认证标识</span><b>{{ authInfo.masked }}</b></div>
+        <div class="saved-auth-list account-saved-list" v-if="savedAccounts.length">
+          <div class="saved-auth-item" v-for="item in savedAccounts" :key="item.id" :class="{ 'is-active': item.isActive }">
+            <div class="saved-auth-main">
+              <b>{{ item.label }}</b>
+              <span>{{ item.masked }}</span>
+            </div>
+            <div class="saved-auth-actions">
+              <a-button class="line-btn sm" size="small" type="outline" :disabled="item.isActive || switchingAccount" @click="switchAccount(item.id)">
+                {{ item.isActive ? '当前账号' : '切换' }}
+              </a-button>
+              <a-button class="line-btn sm" size="small" type="outline" :disabled="switchingAccount" @click="editAccount(item.id)">
+                编辑
+              </a-button>
+              <a-button class="line-btn sm" size="small" type="outline" status="danger" :disabled="switchingAccount" @click="removeAccount(item.id)">
+                删除
+              </a-button>
+            </div>
+          </div>
+        </div>
         <div class="account-actions">
           <div class="account-actions-top">
-            <a-button class="primary-btn" type="primary" @click="goLogin">编辑 API Key</a-button>
+            <a-button class="primary-btn" type="primary" @click="goLogin">新增账号</a-button>
           </div>
           <div class="account-actions-bottom">
-            <a-button class="line-btn" type="outline" @click="logout">退出登录</a-button>
+            <a-button class="line-btn" type="outline" @click="logout">退出当前账号</a-button>
             <a-button class="line-btn about-btn" type="outline" @click="openAbout">关于应用</a-button>
             <a-button class="line-btn update-btn" type="outline" @click="checkUpdate">检查更新</a-button>
           </div>
@@ -5200,6 +5591,7 @@ const MePage = {
     const summary = computed(() => store.summary);
     const router = useRouter();
     const showAboutModal = ref(false);
+    const switchingAccount = ref(false);
 
     const userCard = computed(() => {
       const profile = store.userProfile || {};
@@ -5239,15 +5631,61 @@ const MePage = {
       const masked = raw ? `${raw.slice(0, 3)}***${raw.slice(-3)}` : "-";
       return { modeText: "API Key", masked };
     });
+    const savedAccounts = computed(() => (Array.isArray(store.authAccounts) ? store.authAccounts : []).map((item) => ({
+      id: item.id,
+      label: item.label || buildSavedAuthLabel({}, item),
+      masked: maskApiKey(item.apiKey),
+      isActive: item.id && item.id === String(store.auth.savedId || "").trim()
+    })));
     const goLogin = () => router.push("/login?edit=1");
+    const editAccount = (savedId) => router.push({ path: "/login", query: { edit: "1", savedId } });
     const logout = () => {
-      saveAuth({ baseUrl: store.auth.baseUrl, apiKey: "", devToken: "", authMode: "apiKey", account: "" });
+      saveAuth({ ...createDefaultAuth(), baseUrl: store.auth.baseUrl || "https://api.v2.rainyun.com" });
       store.userProfile = null;
       store.rawSummary = null;
       store.summary = { domain: [], rca: [], rcs: [], rgpu: [], rgs: [], ssl_order: [] };
       toast("已退出登录");
       router.replace("/login");
     };
+
+    async function switchAccount(savedId) {
+      const target = (store.authAccounts || []).find((item) => item.id === savedId);
+      if (!target) {
+        toast("未找到该账号");
+        return;
+      }
+      switchingAccount.value = true;
+      showAppWait("账号切换中，请您耐心等待。", "账号切换");
+      try {
+        saveAuth({
+          ...target,
+          savedId: target.id
+        });
+        await refreshSummary(true);
+        toast(`已切换到 ${target.label || maskApiKey(target.apiKey)}`);
+      } catch (e) {
+        toast(`切换失败：${String(e || "")}`);
+      } finally {
+        hideAppWait();
+        switchingAccount.value = false;
+      }
+    }
+
+    async function removeAccount(savedId) {
+      const target = (store.authAccounts || []).find((item) => item.id === savedId);
+      if (!target) return;
+      const ok = await appConfirm(
+        `确认删除已保存账号“${target.label || maskApiKey(target.apiKey)}”？`,
+        { title: "删除账号", confirmText: "删除", cancelText: "取消" }
+      );
+      if (!ok) return;
+      removeSavedAuthAccount(savedId);
+      if (!isAuthenticated()) {
+        router.replace("/login");
+      } else {
+        toast("已删除保存的账号");
+      }
+    }
 
     function openAbout() {
       showAboutModal.value = true;
@@ -5375,6 +5813,8 @@ const MePage = {
     return {
       summary,
       authInfo,
+      savedAccounts,
+      switchingAccount,
       userCard,
       avatarUrl,
       showAboutModal,
@@ -5382,6 +5822,9 @@ const MePage = {
       brandLogo: BRAND_LOGO,
       goLogin,
       logout,
+      switchAccount,
+      editAccount,
+      removeAccount,
       openAbout,
       closeAbout,
       onAboutModalEnter,
@@ -5452,10 +5895,24 @@ const RootApp = {
           </div>
         </div>
       </transition>
+      <transition :css="false" @enter="onDialogEnter" @leave="onDialogLeave">
+        <div v-if="waitState.visible" class="app-dialog-mask app-wait-mask">
+          <div class="app-dialog app-wait-dialog" role="dialog" aria-modal="true" aria-busy="true">
+            <div class="app-dialog-head">
+              <h3>{{ waitState.title }}</h3>
+            </div>
+            <div class="app-dialog-body app-wait-body">
+              <div class="app-wait-spinner" aria-hidden="true"></div>
+              <p v-if="waitState.message" class="app-dialog-message">{{ waitState.message }}</p>
+            </div>
+          </div>
+        </div>
+      </transition>
     </div>
   `,
   setup() {
     const loading = computed(() => store.loading);
+    const waitState = appWaitState;
     const bootVisible = ref(true);
     const minBootElapsed = ref(false);
     const bootProgress = ref(12);
@@ -5771,6 +6228,7 @@ const RootApp = {
 
     return {
       loading,
+      waitState,
       bootVisible,
       bootProgress,
       bootMode,
