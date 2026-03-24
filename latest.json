@@ -1,7 +1,7 @@
 {
   "version": "1.1.9",
   "downloadUrl": "http://ros.yuban.cloud/app/RainYun-App-v1.1.9-release.apk",
-  "notes": "新增积分中心。",
+  "notes": "新增积分中心。\n 需要先卸载已安装旧版本后再重新安装。",
   "sha256": "4E8732993A1C3BABAF11569154DFCE7C73C77889B9C9B8D09DEC634F0612A932",
   "buildTime": "2026-03-24T11:35:09+08:00",
   "force": false,
