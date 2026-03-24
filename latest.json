@@ -1,11 +1,18 @@
 {
-  "version": "1.1.8",
-  "downloadUrl": "http://ros.yuban.cloud/app/RainYun-App-v1.1.8-release.apk",
-  "notes": "1. 修复游戏云部分已知问题。\n2. 支持多账号登录，切换，编辑。",
-  "sha256": "1CE2BCBDBE616429D6AF755E2024CD2F6144923C962925CD087F1496D11BEC37",
-  "buildTime": "2026-03-06T09:33:08+08:00",
+  "version": "1.1.9",
+  "downloadUrl": "http://ros.yuban.cloud/app/RainYun-App-v1.1.9-release.apk",
+  "notes": "新增积分中心。",
+  "sha256": "4E8732993A1C3BABAF11569154DFCE7C73C77889B9C9B8D09DEC634F0612A932",
+  "buildTime": "2026-03-24T11:35:09+08:00",
   "force": false,
   "history": [
+    {
+      "version": "1.1.9",
+      "notes": "新增积分中心。",
+      "buildTime": "2026-03-24T11:35:09+08:00",
+      "downloadUrl": "http://ros.yuban.cloud/app/RainYun-App-v1.1.9-release.apk",
+      "sha256": "4E8732993A1C3BABAF11569154DFCE7C73C77889B9C9B8D09DEC634F0612A932"
+    },
     {
       "version": "1.1.8",
       "notes": "1. 修复游戏云部分已知问题。\n2. 支持多账号登录，切换，编辑。",

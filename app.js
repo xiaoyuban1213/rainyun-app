@@ -13,7 +13,7 @@ import "@arco-design/web-vue/es/typography/style/css.js";
 
 const BRAND_LOGO = new URL("./assets/icons/app-icon-20260228.jpg", import.meta.url).href;
 const AVATAR = new URL("./assets/images/default-avatar.svg", import.meta.url).href;
-const APP_VERSION = "1.1.8";
+const APP_VERSION = "1.1.9";
 const SEASON_BG_MAP = {
   spring: "https://forum.rainyun.com/uploads/default/original/2X/c/c945ac6e94feae902f54476fd53c65cc74d027fb.webp",
   summer: "https://forum.rainyun.com/uploads/default/original/2X/b/b89be1c923371d70912118bc3038cee6f1f77f0f.webp",
@@ -28,6 +28,9 @@ const API_TTL_META_MS = 10000;
 const API_REQUEST_LOG_FLUSH_MS = 1200;
 const API_REQUEST_LOG_FLUSH_BATCH = 18;
 const API_REQUEST_LOG_MONITOR_DEDUPE_MS = 4000;
+const ENABLE_DEBUG_REQUEST_LOGS = false;
+const MONITOR_RETRY_COOLDOWN_MS = 3 * 60 * 1000;
+const MONITOR_UNAVAILABLE_DEDUPE_MS = 90 * 1000;
 let navOriginTrackerInited = false;
 
 function syncAppViewportHeight() {
@@ -152,6 +155,7 @@ const TENCENT_CAPTCHA_APP_ID = "2039519451";
 const apiRequestLogBuffer = [];
 const apiRequestLogRecentMap = new Map();
 const apiRequestPreferredBase = { value: "", at: 0 };
+const runtimeWarningDedupMap = new Map();
 const rgsMcsmPanelUsersCache = {
   at: 0,
   items: null,
@@ -267,8 +271,32 @@ function hideAppWait() {
   appWaitState.message = "";
 }
 
+function shouldEmitInfoLogs() {
+  if (ENABLE_DEBUG_REQUEST_LOGS) return true;
+  if (typeof window === "undefined") return false;
+  try {
+    const flag = String(window.localStorage?.getItem("rainyun-debug-logs") || "").trim().toLowerCase();
+    return flag === "1" || flag === "true" || flag === "on" || flag === "debug";
+  } catch {
+    return false;
+  }
+}
+
+function shouldEmitWarnWithDedupe(key, windowMs = MONITOR_UNAVAILABLE_DEDUPE_MS) {
+  const dedupeKey = String(key || "").trim();
+  if (!dedupeKey) return true;
+  const now = Date.now();
+  const lastAt = Number(runtimeWarningDedupMap.get(dedupeKey) || 0);
+  if (lastAt && (now - lastAt) < Math.max(1000, Number(windowMs) || MONITOR_UNAVAILABLE_DEDUPE_MS)) {
+    return false;
+  }
+  runtimeWarningDedupMap.set(dedupeKey, now);
+  return true;
+}
+
 function reportLog(level, event, detail = {}) {
   if (typeof console === "undefined") return;
+  if (level === "INFO" && !shouldEmitInfoLogs()) return;
   const payload = { level, event, detail, at: new Date().toISOString() };
   if (level === "ERROR") {
     console.error("[rainyun-app]", payload);
@@ -2657,6 +2685,7 @@ const MobileShell = {
 
       <nav ref="tabbarRef" class="m-tabbar">
         <button :class="tabClass('/home')" @click="go('/home')"><i class="fa-solid fa-house"></i><span>主页</span></button>
+        <button :class="tabClass('/reward')" @click="go('/reward')"><i class="fa-solid fa-coins"></i><span>积分中心</span></button>
         <button :class="tabClass('/promo')" @click="go('/promo')"><i class="fa-solid fa-bullhorn"></i><span>推广中心</span></button>
         <button :class="tabClass(isAuthed ? '/me' : '/login')" @click="go(isAuthed ? '/me' : '/login')"><i class="fa-solid fa-user"></i><span>我的</span></button>
       </nav>
@@ -2679,10 +2708,10 @@ const MobileShell = {
     const touchState = { active: false, startX: 0, startY: 0, deltaX: 0, deltaY: 0 };
     const isTabRootPath = (path) => {
       const p = String(path || "/");
-      return p === "/" || p === "/home" || p === "/promo" || p === "/me" || p === "/login";
+      return p === "/" || p === "/home" || p === "/reward" || p === "/promo" || p === "/me" || p === "/login";
     };
     const tabClass = (path) => ["tab-item", route.path.startsWith(path) ? "active" : ""];
-    // Tab 页面切换不进入 history，避免返回键在三个 Tab 之间来回切换。
+    // Tab 页面切换不进入 history，避免返回键在几个主 Tab 之间来回切换。
     const go = (path) => router.replace(path);
     const goAccount = () => go(isAuthed.value ? "/me" : "/login");
     const fallbackRouteByPath = (path) => {
@@ -2694,7 +2723,8 @@ const MobileShell = {
         if (seg.length >= 3) return `/product/${seg[1]}`;
         return "/home";
       }
-      if (p === "/promo" || p === "/me") return "/home";
+      if (p.startsWith("/reward/")) return "/reward";
+      if (p === "/reward" || p === "/promo" || p === "/me") return "/home";
       return "/home";
     };
     const goBackSafe = () => {
@@ -4049,9 +4079,7 @@ const ProductDetailPage = {
         monitor: `/product/rcs/${productId}/monitor`,
         detailCandidates: [],
         monitorCandidates: [
-          `/product/rcs/${productId}/metrics`,
-          `/product/rcs/${productId}/monitor?range=1h`,
-          `/product/rcs/${productId}/monitor?step=60`
+          `/product/rcs/${productId}/metrics`
         ]
       };
     }
@@ -4061,9 +4089,7 @@ const ProductDetailPage = {
         monitor: `/product/rcs/${productId}/monitor`,
         detailCandidates: [],
         monitorCandidates: [
-          `/product/rcs/${productId}/metrics`,
-          `/product/rcs/${productId}/monitor?range=1h`,
-          `/product/rcs/${productId}/monitor?step=60`
+          `/product/rcs/${productId}/metrics`
         ]
       };
     }
@@ -4146,19 +4172,20 @@ const ProductDetailPage = {
         }
         const detailRoot = detailData && detailData.Data && typeof detailData.Data === "object" ? detailData.Data : detailData;
         const isMcsmRgs = kind.value === "rgs" && getRgsSubtype(detailData, detailRoot).includes("mcsm");
-        const hasInlineRgsUsage = kind.value === "rgs"
-          && detailRoot
+        const hasInlineUsage = detailRoot
           && typeof detailRoot === "object"
           && detailRoot.UsageData
           && typeof detailRoot.UsageData === "object"
           && Object.keys(detailRoot.UsageData).length > 0;
-        if (isMcsmRgs || hasInlineRgsUsage) {
+        const hasInlineRgsUsage = kind.value === "rgs"
+          && hasInlineUsage;
+        if (isMcsmRgs || hasInlineUsage) {
           monitorPath.value = "";
           monitorResolvedPath.value = "";
           monitorRetryDisabledUntil.value = 0;
         }
         let monitorData = {};
-        if (endpoint.monitor && !isMcsmRgs && !hasInlineRgsUsage) {
+        if (endpoint.monitor && !isMcsmRgs && !hasInlineUsage) {
           try {
             const now = Date.now();
             const fallbackPaths = [
@@ -4191,13 +4218,16 @@ const ProductDetailPage = {
             }
             if (!ok) {
               // 避免自动刷新期间持续探测多个失败候选接口导致控制台刷屏。
-              if (silent) {
-                monitorRetryDisabledUntil.value = Date.now() + 3 * 60 * 1000;
+              monitorRetryDisabledUntil.value = Date.now() + MONITOR_RETRY_COOLDOWN_MS;
+              if (shouldEmitWarnWithDedupe(`monitor_api_unavailable:${kind.value}:${id.value}:${endpoint.monitor}`)) {
+                reportLog("WARN", "monitor_api_unavailable", { kind: kind.value, id: id.value, endpoint: endpoint.monitor });
               }
-              reportLog("WARN", "monitor_api_unavailable", { kind: kind.value, id: id.value, endpoint: endpoint.monitor });
             }
           } catch (e) {
-            reportLog("WARN", "monitor_api_error", { kind: kind.value, id: id.value, error: String(e) });
+            monitorRetryDisabledUntil.value = Date.now() + MONITOR_RETRY_COOLDOWN_MS;
+            if (shouldEmitWarnWithDedupe(`monitor_api_error:${kind.value}:${id.value}:${endpoint.monitor}`)) {
+              reportLog("WARN", "monitor_api_error", { kind: kind.value, id: id.value, error: String(e) });
+            }
           }
         }
         const panelCreds = isMcsmRgs
@@ -4598,6 +4628,1084 @@ const ProductDetailPage = {
       showNoVncButton,
       onVncEnter,
       onVncLeave
+    };
+  }
+};
+
+function normalizeRewardTaskStatus(status) {
+  const code = Number(status);
+  if (code === 2) {
+    return {
+      code,
+      text: "已完成",
+      color: "green",
+      actionText: "已完成",
+      actionDisabled: true,
+      actionMode: "done"
+    };
+  }
+  if (code === 1) {
+    return {
+      code,
+      text: "可领取",
+      color: "arcoblue",
+      actionText: "领取奖励",
+      actionDisabled: false,
+      actionMode: "claim"
+    };
+  }
+  return {
+    code,
+    text: "去完成",
+    color: "orangered",
+    actionText: "去完成",
+    actionDisabled: false,
+    actionMode: "complete"
+  };
+}
+
+const REWARD_VERIFY_TASKS = {
+  "加入用户群": ["我爱雨云", "雨云爱我"],
+  "加入Q群": ["我爱雨云"],
+  "加入微信群": ["雨云爱我"],
+  "关注雨云淘宝店": ["成功加入", "关注成功"],
+  "关注雨云B站号": ["雨云爱你"]
+};
+
+const REWARD_VERIFY_HINTS = {
+  "加入用户群": "加入任意官方群后输入公告内提供的验证码。",
+  "加入Q群": "加入 QQ 群后查看公告并输入验证码。",
+  "加入微信群": "加入微信群后输入群内提供的验证码。",
+  "关注雨云淘宝店": "完成关注后输入页面提示的验证码。",
+  "关注雨云B站号": "完成关注后输入页面提示的验证码。"
+};
+
+const REWARD_PRODUCT_TYPE_LABELS = {
+  rcs: "云服务器",
+  rvh: "虚拟主机",
+  rgs: "游戏云",
+  ros: "对象存储",
+  rbm: "裸金属物理机"
+};
+
+const REWARD_STORE_GROUP_LABELS = {
+  point: "积分专区",
+  product: "免费产品专区",
+  coupon: "优惠券专区",
+  houlangs: "后浪专区",
+  accessories: "雨云周边福利"
+};
+
+const REWARD_WITHDRAW_STATUS_LABELS = {
+  waiting: "审核中",
+  returned: "已打回",
+  passed: "审核通过",
+  finished: "已完成",
+  error: "错误"
+};
+
+function detectRewardTaskMode(taskName) {
+  const name = String(taskName || "");
+  if (!name) return "claim";
+  if (REWARD_VERIFY_TASKS[name]) return "verify";
+  if (name.includes("消费")) return "products";
+  if (name.includes("推广")) return "promo";
+  if (name.includes("邮箱") || name.includes("手机") || name.includes("QQ") || name.includes("微信")) return "bind";
+  return "claim";
+}
+
+function normalizeRewardTaskRows(items) {
+  if (!Array.isArray(items)) return [];
+  return items.map((item, index) => {
+    const statusMeta = normalizeRewardTaskStatus(item?.Status);
+    const mode = detectRewardTaskMode(item?.Name);
+    return {
+      id: `${String(item?.Name || "task")}-${index}`,
+      name: String(item?.Name || "未命名任务"),
+      detail: String(item?.Detail || "暂无任务说明"),
+      pointsValue: Math.max(0, Number(item?.Points || 0)),
+      pointsText: formatCount(Math.max(0, Number(item?.Points || 0))),
+      statusCode: statusMeta.code,
+      statusText: statusMeta.text,
+      statusColor: statusMeta.color,
+      actionText: statusMeta.actionText,
+      actionDisabled: statusMeta.actionDisabled,
+      actionMode: statusMeta.code === 2 ? "done" : (statusMeta.actionMode === "claim" ? "claim" : mode),
+      verifyHints: REWARD_VERIFY_TASKS[String(item?.Name || "")] || [],
+      verifyMessage: REWARD_VERIFY_HINTS[String(item?.Name || "")] || ""
+    };
+  });
+}
+
+function normalizeRewardProductRows(payload) {
+  const data = payload && typeof payload === "object" ? payload : {};
+  const rows = [];
+  Object.entries(data).forEach(([type, items]) => {
+    if (!Array.isArray(items)) return;
+    items.forEach((item, index) => {
+      const productId = String(item?.product_id || item?.ProductId || item?.id || item?.ID || "");
+      if (!productId) return;
+      const pointsValue = Math.max(0, Number(item?.collectable_points || item?.CollectablePoints || item?.points || 0));
+      const timeValue = item?.time || item?.consume_time || item?.create_time || item?.CreateTime || "";
+      rows.push({
+        id: `${type}-${productId}-${index}`,
+        productId,
+        productType: String(type || item?.product_type || item?.ProductType || ""),
+        productLabel: REWARD_PRODUCT_TYPE_LABELS[String(type || "")] || String(type || "产品"),
+        name: String(item?.name || item?.friendly_name || item?.ProductName || REWARD_PRODUCT_TYPE_LABELS[String(type || "")] || "未命名产品"),
+        pointsValue,
+        pointsText: formatCount(pointsValue),
+        unsubscribeAble: Boolean(item?.UnsubscribeAble || item?.unsubscribe_able || item?.unsubscribeAble),
+        timeText: timeValue ? formatDateTime(timeValue) : "",
+        statusText: String(item?.status_text || item?.status || item?.StatusText || "").trim()
+      });
+    });
+  });
+  return rows;
+}
+
+function normalizeRewardStoreGroups(payload) {
+  const list = Array.isArray(payload) ? payload : [];
+  const bucket = new Map();
+  list.forEach((item, index) => {
+    const type = String(item?.type || item?.Type || "other");
+    const source = item?.item_data && typeof item.item_data === "object" ? item.item_data : {};
+    const stockValue = toNumberOrNull(item?.available_stock ?? item?.AvailableStock);
+    const pointsValue = Math.max(0, Number(item?.points || item?.Points || 0));
+    const normalized = {
+      id: String(item?.id || item?.ID || `${type}-${index}`),
+      type,
+      title: String(item?.friendly_name || item?.name || item?.Name || "未命名商品"),
+      subtitle: String(source?.friendly_name || source?.title || source?.desc || "").trim(),
+      pointsValue,
+      pointsText: formatCount(pointsValue),
+      stockText: stockValue === null ? "不限库存" : `库存 ${formatCount(stockValue)}`,
+      disabled: Boolean(item?.disabled || item?.Disabled) || (stockValue !== null && stockValue <= 0),
+      limitText: item?.buy_limit ? `限购 ${formatCount(item.buy_limit)} 件` : "",
+      raw: item
+    };
+    if (!bucket.has(type)) {
+      bucket.set(type, {
+        key: type,
+        title: REWARD_STORE_GROUP_LABELS[type] || "其他福利",
+        items: []
+      });
+    }
+    bucket.get(type).items.push(normalized);
+  });
+  return Array.from(bucket.values());
+}
+
+function buildRewardWithdrawPath(page = 1, perPage = 20) {
+  const options = encodeURIComponent(JSON.stringify({
+    columnFilters: {},
+    sort: [],
+    page,
+    perPage: Math.max(20, Number(perPage) || 20)
+  }));
+  return `/user/reward/withdraw?options=${options}`;
+}
+
+function normalizeRewardWithdrawRows(payload) {
+  const data = payload && typeof payload === "object" ? payload : {};
+  const list = Array.isArray(data?.Records) ? data.Records : [];
+  return list.map((item, index) => {
+    const statusKey = String(item?.status || "").trim();
+    const targetKey = String(item?.target || "").trim();
+    return {
+      id: String(item?.id || `withdraw-${index}`),
+      account: String(item?.account || item?.alipay_name || "-"),
+      targetText: targetKey === "alipay" ? "支付宝" : (targetKey === "rainyun" ? "雨云余额" : (targetKey || "-")),
+      pointsText: formatCount(Math.max(0, Number(item?.points || 0))),
+      moneyText: formatMoney(Number(item?.money || 0)),
+      statusText: REWARD_WITHDRAW_STATUS_LABELS[statusKey] || (statusKey || "未知"),
+      statusColor: statusKey === "finished" ? "green" : (statusKey === "waiting" || statusKey === "passed" ? "arcoblue" : (statusKey === "returned" || statusKey === "error" ? "orangered" : "gray")),
+      timeText: formatDateTime(item?.time),
+      infoText: String(item?.info || item?.remark || "").trim()
+    };
+  });
+}
+
+const RewardPage = {
+  components: { MobileShell },
+  template: `
+    <MobileShell :title="pageTitle">
+      <section class="panel" v-if="!isAuthed">
+        <div class="panel-title">
+          <a-typography-title :heading="6" class="typo-title">积分中心</a-typography-title>
+          <a-typography-text class="panel-subtext" type="secondary">登录后可查看积分资产与任务状态</a-typography-text>
+        </div>
+        <p class="muted">当前未登录，无法同步积分、冻结积分、商城和提现记录。</p>
+        <div class="action-grid">
+          <a-button class="primary-btn" type="primary" @click="goLogin">去登录</a-button>
+        </div>
+      </section>
+
+      <template v-else>
+        <template v-if="pageMode === 'home'">
+        <section class="panel reward-overview-panel">
+          <div class="panel-title">
+            <a-typography-title :heading="6" class="typo-title">积分概览</a-typography-title>
+            <a-typography-text class="panel-subtext sync-time-text" type="secondary">同步 {{ rewardUpdatedAt || '--:--:--' }}</a-typography-text>
+          </div>
+          <div class="stat-grid reward-stat-grid">
+          <div class="stat-cell stat-points stat-cell-featured">
+            <div class="stat-cell-head"><i class="fa-solid fa-coins"></i><span>当前积分</span></div>
+            <b>{{ rewardAnimated.points }}</b>
+            <small>当前可提现 {{ withdrawAvailablePointsText }} 积分</small>
+          </div>
+          <div class="stat-cell">
+            <div class="stat-cell-head"><i class="fa-solid fa-lock"></i><span>冻结积分</span></div>
+            <b>{{ rewardAnimated.lockPoints }}</b>
+            <small>暂不可用积分</small>
+          </div>
+          <div class="stat-cell">
+            <div class="stat-cell-head"><i class="fa-solid fa-yen-sign"></i><span>可提现金额</span></div>
+            <b>{{ rewardAnimated.cashEquivalent }}</b>
+            <small>按 2000 积分 = 1 元换算</small>
+          </div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-title">
+            <a-typography-title :heading="6" class="typo-title">积分功能</a-typography-title>
+            <div class="title-actions">
+              <a-button class="line-btn sm" size="small" type="outline" :loading="refreshing" @click="refreshReward">{{ refreshing ? '同步中...' : '刷新' }}</a-button>
+            </div>
+          </div>
+          <div class="entry-grid reward-entry-grid">
+            <button class="entry" v-for="item in rewardEntries" :key="item.key" @click="openRewardSection(item.path)">
+              <div class="entry-head reward-entry-head">
+                <div class="reward-entry-title">
+                  <i :class="item.icon"></i>
+                  <span>{{ item.label }}</span>
+                </div>
+                <i class="fa-solid fa-chevron-right reward-entry-arrow"></i>
+              </div>
+              <div class="entry-meta">
+                <em>{{ item.emphasis }}</em>
+                <small>{{ item.desc }}</small>
+              </div>
+            </button>
+          </div>
+        </section>
+        </template>
+
+        <section v-if="pageMode === 'tasks'" class="panel reward-section-panel reward-task-panel">
+          <div class="panel-title">
+            <a-typography-title :heading="6" class="typo-title">积分任务</a-typography-title>
+            <a-typography-text class="panel-subtext" type="secondary">{{ taskSummary }}</a-typography-text>
+          </div>
+          <p v-if="taskErrorText" class="error-text">{{ taskErrorText }}</p>
+          <div v-else-if="loading && !taskRows.length" class="empty">正在同步积分任务...</div>
+          <div v-else-if="!taskRows.length" class="empty">当前没有可展示的积分任务</div>
+          <div v-else class="reward-task-list">
+            <div class="reward-task-item" v-for="task in taskRows" :key="task.id">
+              <div class="reward-task-head">
+                <b>{{ task.name }}</b>
+                <a-tag size="small" bordered :color="task.statusColor">{{ task.statusText }}</a-tag>
+              </div>
+              <p>{{ task.detail }}</p>
+              <div class="reward-task-foot">
+                <span>+{{ task.pointsText }} 积分</span>
+                <a-button class="line-btn sm" size="small" type="outline" :disabled="task.actionDisabled" :loading="taskLoadingMap[task.id]" @click="handleTask(task)">
+                  {{ task.actionText }}
+                </a-button>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section v-if="pageMode === 'products'" class="panel reward-section-panel reward-products-panel">
+          <div class="panel-title">
+            <a-typography-title :heading="6" class="typo-title">消费积分</a-typography-title>
+            <div class="title-actions">
+              <a-typography-text class="panel-subtext" type="secondary">按消费记录领取积分</a-typography-text>
+              <a-button class="line-btn sm" size="small" type="outline" :loading="productsLoading" @click="refreshRewardProducts">刷新</a-button>
+            </div>
+          </div>
+          <p v-if="productsErrorText" class="error-text">{{ productsErrorText }}</p>
+          <div v-else-if="productsLoading && !rewardProductRows.length" class="empty">正在同步消费积分数据...</div>
+          <div v-else-if="!rewardProductRows.length" class="empty">暂无可领取的消费积分记录。</div>
+          <template v-else>
+            <div class="panel-toolbar">
+              <span class="muted">{{ rewardProductRows.length }} 条记录，合计 {{ rewardProductsTotalText }} 积分</span>
+              <a-button class="line-btn sm" size="small" type="outline" :loading="productsClaimAllLoading" @click="claimAllRewardProducts">一键领取</a-button>
+            </div>
+            <div class="reward-product-list">
+              <div class="reward-product-item" v-for="row in rewardProductRows" :key="row.id">
+                <div class="reward-product-head">
+                  <div>
+                    <b>{{ row.name }}</b>
+                    <small>{{ row.productLabel }} · #{{ row.productId }}</small>
+                  </div>
+                  <strong>+{{ row.pointsText }}</strong>
+                </div>
+                <p class="reward-product-meta">
+                  <span v-if="row.timeText">消费时间：{{ row.timeText }}</span>
+                  <span v-if="row.statusText">{{ row.statusText }}</span>
+                  <span v-if="row.unsubscribeAble">领取后不支持退回积分</span>
+                </p>
+                <div class="reward-product-actions">
+                  <a-button class="line-btn sm" size="small" type="outline" :loading="productClaimLoadingMap[row.id]" @click="claimRewardProduct(row)">领取积分</a-button>
+                </div>
+              </div>
+            </div>
+          </template>
+        </section>
+
+        <section v-if="pageMode === 'store'" class="panel reward-section-panel reward-store-panel">
+          <div class="panel-title">
+            <a-typography-title :heading="6" class="typo-title">积分商城</a-typography-title>
+            <div class="title-actions">
+              <a-typography-text class="panel-subtext" type="secondary">每晚 20:00 随机刷新</a-typography-text>
+              <a-button class="line-btn sm" size="small" type="outline" :loading="storeLoading" @click="refreshRewardStore">刷新</a-button>
+            </div>
+          </div>
+          <div class="reward-inline-form">
+            <label>兑换码</label>
+            <div class="reward-inline-form-row">
+              <input v-model.trim="couponCode" placeholder="输入兑换码后激活" />
+              <a-button class="line-btn sm" size="small" type="outline" :disabled="!couponCode" :loading="couponActivating" @click="activateCouponCode">激活</a-button>
+            </div>
+          </div>
+          <p v-if="storeErrorText" class="error-text">{{ storeErrorText }}</p>
+          <div v-else-if="storeLoading && !rewardStoreGroups.length" class="empty">正在同步积分商城...</div>
+          <div v-else-if="!rewardStoreGroups.length" class="empty">当前积分商城没有可展示的商品。</div>
+          <div v-else class="reward-store-groups">
+            <div class="reward-store-group" v-for="group in rewardStoreGroups" :key="group.key">
+              <div class="reward-store-group-head">
+                <b>{{ group.title }}</b>
+                <span>{{ group.items.length }} 项</span>
+              </div>
+              <div class="reward-store-grid">
+                <div class="reward-store-item" v-for="item in group.items" :key="item.id">
+                  <div class="reward-store-item-head">
+                    <b>{{ item.title }}</b>
+                    <span>{{ item.pointsText }} 积分</span>
+                  </div>
+                  <p>{{ item.subtitle || '按主站当前库存与兑换规则执行。' }}</p>
+                  <div class="reward-store-item-foot">
+                    <small>{{ item.stockText }}<template v-if="item.limitText"> · {{ item.limitText }}</template></small>
+                    <a-button class="line-btn sm" size="small" type="outline" :disabled="item.disabled" :loading="storeRedeemLoadingMap[item.id]" @click="redeemRewardItem(item)">
+                      {{ item.type === 'accessories' ? '兑换' : '领取' }}
+                    </a-button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section v-if="pageMode === 'withdraw'" class="panel reward-section-panel reward-withdraw-panel">
+          <div class="panel-title">
+            <a-typography-title :heading="6" class="typo-title">积分提现</a-typography-title>
+            <div class="title-actions">
+              <a-button class="line-btn sm" size="small" type="outline" :loading="withdrawLoading" @click="refreshRewardWithdraw">刷新</a-button>
+            </div>
+          </div>
+          <div class="reward-withdraw-grid">
+            <div class="reward-withdraw-form">
+              <div class="reward-withdraw-balance">
+                <span>可提现积分</span>
+                <b>{{ withdrawAvailablePointsText }}</b>
+              </div>
+              <label>提现积分</label>
+              <input v-model.trim="withdrawForm.points" inputmode="numeric" placeholder="请输入要提现的积分数" />
+              <div class="reward-withdraw-quick">
+                <button
+                  v-for="item in withdrawQuickActions"
+                  :key="item.key"
+                  type="button"
+                  class="chip-btn quick"
+                  :class="{ disabled: item.disabled }"
+                  :disabled="item.disabled"
+                  @click="fillWithdrawPoints(item.points)"
+                >
+                  {{ item.label }}
+                </button>
+              </div>
+              <div class="reward-withdraw-targets">
+                <button type="button" class="chip-btn" :class="{ active: withdrawForm.target === 'alipay' }" @click="withdrawForm.target = 'alipay'">支付宝</button>
+                <button type="button" class="chip-btn" :class="{ active: withdrawForm.target === 'rainyun' }" @click="withdrawForm.target = 'rainyun'">雨云余额</button>
+              </div>
+              <div class="reward-withdraw-hint">
+                <span>预计到账</span>
+                <b>{{ withdrawPreviewText }}</b>
+              </div>
+              <a-button class="primary-btn" type="primary" :loading="withdrawSubmitting" @click="submitRewardWithdraw">提交提现</a-button>
+            </div>
+            <div class="reward-withdraw-history">
+              <div class="reward-store-group-head">
+                <b>提现记录</b>
+                <span>{{ withdrawRows.length }} 条</span>
+              </div>
+              <p v-if="withdrawErrorText" class="error-text">{{ withdrawErrorText }}</p>
+              <div v-else-if="withdrawLoading && !withdrawRows.length" class="empty">正在同步提现记录...</div>
+              <div v-else-if="!withdrawRows.length" class="empty">当前没有提现记录。</div>
+              <div v-else class="reward-withdraw-list">
+                <div class="reward-withdraw-item" v-for="row in withdrawRows" :key="row.id">
+                  <div class="reward-withdraw-item-head">
+                    <b>{{ row.moneyText }}</b>
+                    <a-tag size="small" bordered :color="row.statusColor">{{ row.statusText }}</a-tag>
+                  </div>
+                  <p>{{ row.targetText }} · {{ row.account }}</p>
+                  <small>{{ row.pointsText }} 积分 · {{ row.timeText }}</small>
+                  <small v-if="row.infoText">{{ row.infoText }}</small>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section v-if="pageMode === 'home'" class="panel">
+          <div class="panel-title">
+            <a-typography-title :heading="6" class="typo-title">积分用途</a-typography-title>
+            <a-typography-text class="panel-subtext" type="secondary">按主站说明整理</a-typography-text>
+          </div>
+          <div class="reward-usage-grid">
+            <div class="reward-usage-item" v-for="item in rewardUses" :key="item.title">
+              <div class="reward-usage-head">
+                <i :class="item.icon"></i>
+                <b>{{ item.title }}</b>
+              </div>
+              <p>{{ item.desc }}</p>
+            </div>
+          </div>
+        </section>
+
+        <section v-if="pageMode !== 'home'" class="panel reward-subpage-actions">
+          <a-button class="line-btn" type="outline" @click="goRewardHome">返回积分中心</a-button>
+        </section>
+
+      </template>
+    </MobileShell>
+  `,
+  setup() {
+    const router = useRouter();
+    const route = useRoute();
+    const isAuthed = computed(() => isAuthenticated());
+    const profile = computed(() => store.userProfile || {});
+    const rawData = computed(() => (store.rawSummary && store.rawSummary.data) ? store.rawSummary.data : {});
+    const loading = ref(false);
+    const refreshing = ref(false);
+    const taskErrorText = ref("");
+    const productsErrorText = ref("");
+    const storeErrorText = ref("");
+    const withdrawErrorText = ref("");
+    const taskRows = ref([]);
+    const rewardUpdatedAt = ref("");
+    const rewardProductRows = ref([]);
+    const rewardStoreGroups = ref([]);
+    const withdrawRows = ref([]);
+    const productsLoading = ref(false);
+    const storeLoading = ref(false);
+    const withdrawLoading = ref(false);
+    const productsClaimAllLoading = ref(false);
+    const couponActivating = ref(false);
+    const withdrawSubmitting = ref(false);
+    const couponCode = ref("");
+    const withdrawForm = reactive({
+      points: "",
+      target: "alipay"
+    });
+    const activeSection = ref("tasks");
+    const taskLoadingMap = reactive({});
+    const productClaimLoadingMap = reactive({});
+    const storeRedeemLoadingMap = reactive({});
+    const sectionRefs = reactive({
+      tasks: null,
+      products: null,
+      store: null,
+      withdraw: null
+    });
+
+    const pointsRaw = computed(() => toNumberOrNull(
+      pickFirstFieldDeep(profile.value, ["Points", "points", "point", "score", "integral", "credit_point", "reward_points"])
+      || pickFirstFieldDeep(rawData.value, ["Points", "points", "point", "score", "integral", "credit_point", "reward_points"])
+    ) ?? 0);
+    const lockPointsRaw = computed(() => toNumberOrNull(
+      pickFirstFieldDeep(profile.value, ["LockPoints", "lock_points", "locked_points", "freeze_points"])
+      || pickFirstFieldDeep(rawData.value, ["LockPoints", "lock_points", "locked_points", "freeze_points"])
+    ) ?? 0);
+    const withdrawAvailablePointsRaw = computed(() => Math.max(0, Math.floor((pointsRaw.value || 0) - (lockPointsRaw.value || 0))));
+    const withdrawAvailablePointsText = computed(() => formatCount(withdrawAvailablePointsRaw.value));
+    const cashEquivalentRaw = computed(() => Number((withdrawAvailablePointsRaw.value / 2000).toFixed(2)));
+
+    const rewardAnimated = {
+      points: useAnimatedNumber(pointsRaw, (n) => (n === null ? "-" : formatCount(n)), { duration: 0.38 }),
+      lockPoints: useAnimatedNumber(lockPointsRaw, (n) => (n === null ? "-" : formatCount(n)), { duration: 0.34 }),
+      cashEquivalent: useAnimatedNumber(cashEquivalentRaw, (n) => (n === null ? "-" : formatMoney(n)), { duration: 0.4 })
+    };
+
+    const rewardEntries = computed(() => [
+      {
+        key: "withdraw",
+        path: "/reward/withdraw",
+        label: "积分提现",
+        icon: "fa-solid fa-money-bill-transfer",
+        emphasis: "2000 = 1元",
+        desc: "查看提现记录"
+      },
+      {
+        key: "store",
+        path: "/reward/store",
+        label: "积分商城",
+        icon: "fa-solid fa-store",
+        emphasis: "兑换权益",
+        desc: "优惠券与道具"
+      },
+      {
+        key: "products",
+        path: "/reward/products",
+        label: "消费积分",
+        icon: "fa-solid fa-receipt",
+        emphasis: "按消费领积分",
+        desc: "消费奖励领取"
+      },
+      {
+        key: "tasks",
+        path: "/reward/tasks",
+        label: "推广赚积分",
+        icon: "fa-solid fa-share-nodes",
+        emphasis: "任务中心",
+        desc: "更多获取方式"
+      }
+    ]);
+
+    const rewardUses = computed(() => [
+      {
+        icon: "fa-solid fa-yen-sign",
+        title: "积分提现",
+        desc: "主站当前按 2000 积分 = 1 元处理提现，具体到账与门槛以主站为准。"
+      },
+      {
+        icon: "fa-solid fa-gift",
+        title: "商城兑换",
+        desc: "可在应用内兑换优惠券、活动权益或其他积分商品。"
+      },
+      {
+        icon: "fa-solid fa-list-check",
+        title: "完成任务",
+        desc: "每日签到、账号绑定、社区关注和消费奖励都会在主站积分中心同步。"
+      }
+    ]);
+
+    const taskSummary = computed(() => {
+      const total = taskRows.value.length;
+      const claimable = taskRows.value.filter((item) => item.statusCode === 1).length;
+      const completed = taskRows.value.filter((item) => item.statusCode === 2).length;
+      const pending = Math.max(0, total - claimable - completed);
+      return `共 ${total} 项，待完成 ${pending} 项，可领取 ${claimable} 项，已完成 ${completed} 项`;
+    });
+    const rewardProductsTotalText = computed(() => formatCount(rewardProductRows.value.reduce((sum, item) => sum + (Number(item.pointsValue || 0) || 0), 0)));
+    const withdrawPreviewValue = computed(() => {
+      const points = Math.min(
+        withdrawAvailablePointsRaw.value,
+        Math.max(0, Number(withdrawForm.points || 0))
+      );
+      return points ? Number((points / 2000).toFixed(2)) : 0;
+    });
+    const withdrawPreviewText = computed(() => formatMoney(withdrawPreviewValue.value));
+    const withdrawQuickActions = computed(() => {
+      const available = withdrawAvailablePointsRaw.value;
+      const presets = [
+        { key: "30", label: "提现 30 元", points: 60000 },
+        { key: "50", label: "提现 50 元", points: 100000 },
+        { key: "100", label: "提现 100 元", points: 200000 }
+      ].map((item) => ({
+        ...item,
+        disabled: available < item.points
+      }));
+      return [
+        {
+          key: "all",
+          label: "全部提现",
+          points: available,
+          disabled: available < 60000
+        },
+        ...presets
+      ];
+    });
+    const pageMode = computed(() => {
+      const path = String(route.path || "");
+      if (path.endsWith("/tasks")) return "tasks";
+      if (path.endsWith("/products")) return "products";
+      if (path.endsWith("/store")) return "store";
+      if (path.endsWith("/withdraw")) return "withdraw";
+      return "home";
+    });
+    const pageTitle = computed(() => ({
+      home: "积分中心",
+      tasks: "积分任务",
+      products: "消费积分",
+      store: "积分商城",
+      withdraw: "积分提现"
+    }[pageMode.value] || "积分中心"));
+
+    function setSectionRef(key) {
+      return (el) => {
+        sectionRefs[key] = el || null;
+      };
+    }
+
+    async function goToSection(key) {
+      const item = rewardEntries.value.find((entry) => entry.key === key);
+      if (!item?.path) return;
+      activeSection.value = key;
+      router.push(item.path);
+    }
+
+    async function loadRewardTasks(force = false) {
+      loading.value = !taskRows.value.length;
+      taskErrorText.value = "";
+      try {
+        const taskPayload = await apiGet("/user/reward/tasks", { force, ttlMs: API_TTL_META_MS });
+        taskRows.value = normalizeRewardTaskRows(extractPayloadData(taskPayload));
+      } catch (e) {
+        taskRows.value = [];
+        taskErrorText.value = `积分任务同步失败：${String(e || "")}`;
+      } finally {
+        loading.value = false;
+      }
+    }
+
+    async function loadRewardProducts(force = false) {
+      productsLoading.value = !rewardProductRows.value.length;
+      productsErrorText.value = "";
+      try {
+        const payload = await apiGet("/user/reward/products", { force, ttlMs: API_TTL_META_MS });
+        rewardProductRows.value = normalizeRewardProductRows(extractPayloadData(payload));
+      } catch (e) {
+        rewardProductRows.value = [];
+        productsErrorText.value = `消费积分同步失败：${String(e || "")}`;
+      } finally {
+        productsLoading.value = false;
+      }
+    }
+
+    async function loadRewardStore(force = false) {
+      storeLoading.value = !rewardStoreGroups.value.length;
+      storeErrorText.value = "";
+      try {
+        const payload = await apiGet("/user/reward/items", { force, ttlMs: API_TTL_META_MS });
+        rewardStoreGroups.value = normalizeRewardStoreGroups(extractPayloadData(payload));
+      } catch (e) {
+        rewardStoreGroups.value = [];
+        storeErrorText.value = `积分商城同步失败：${String(e || "")}`;
+      } finally {
+        storeLoading.value = false;
+      }
+    }
+
+    async function loadRewardWithdraw(force = false) {
+      withdrawLoading.value = !withdrawRows.value.length;
+      withdrawErrorText.value = "";
+      try {
+        const payload = await apiGet(buildRewardWithdrawPath(), { force, ttlMs: API_TTL_META_MS });
+        withdrawRows.value = normalizeRewardWithdrawRows(extractPayloadData(payload));
+      } catch (e) {
+        withdrawRows.value = [];
+        const msg = String(e || "");
+        withdrawErrorText.value = msg.includes("10006") || msg.includes("30002")
+          ? "当前 API Key 暂不返回提现记录，可继续直接提交提现申请。"
+          : `提现记录同步失败：${msg}`;
+      } finally {
+        withdrawLoading.value = false;
+      }
+    }
+
+    async function ensureRewardSectionLoaded(key, force = false) {
+      if (!isAuthed.value) return;
+      if (key === "tasks" && (force || !taskRows.value.length)) return loadRewardTasks(force);
+      if (key === "products" && (force || !rewardProductRows.value.length)) return loadRewardProducts(force);
+      if (key === "store" && (force || !rewardStoreGroups.value.length)) return loadRewardStore(force);
+      if (key === "withdraw" && (force || !withdrawRows.value.length)) return loadRewardWithdraw(force);
+      return null;
+    }
+
+    async function loadReward(force = false) {
+      if (!isAuthed.value) {
+        taskRows.value = [];
+        rewardProductRows.value = [];
+        rewardStoreGroups.value = [];
+        withdrawRows.value = [];
+        rewardUpdatedAt.value = "";
+        taskErrorText.value = "";
+        productsErrorText.value = "";
+        storeErrorText.value = "";
+        withdrawErrorText.value = "";
+        return;
+      }
+      refreshing.value = true;
+      try {
+        await refreshSummary(force);
+        rewardUpdatedAt.value = new Date().toLocaleTimeString();
+      } finally {
+        refreshing.value = false;
+      }
+    }
+
+    function refreshReward() {
+      return loadReward(true);
+    }
+
+    function refreshRewardProducts() {
+      return loadRewardProducts(true);
+    }
+
+    function refreshRewardStore() {
+      return loadRewardStore(true);
+    }
+
+    function refreshRewardWithdraw() {
+      return loadRewardWithdraw(true);
+    }
+
+    function fillWithdrawPoints(points) {
+      const value = Math.min(
+        withdrawAvailablePointsRaw.value,
+        Math.max(0, Math.floor(Number(points) || 0))
+      );
+      if (value < 60000) return;
+      withdrawForm.points = String(value);
+    }
+
+    function openRewardSection(path) {
+      router.push(path);
+    }
+
+    function goRewardHome() {
+      router.push("/reward");
+    }
+
+    async function claimTaskWithCaptcha(task, verifyCode = "") {
+      const captcha = await runTencentCaptcha();
+      await apiRequest("POST", "/user/reward/tasks", {
+        task_name: task.name,
+        verifyCode: String(verifyCode || ""),
+        vticket: captcha.ticket,
+        vrandstr: captcha.randstr
+      });
+    }
+
+    async function handleTask(task) {
+      if (!task || task.actionDisabled) return;
+      if (task.actionMode === "products") {
+        router.push("/reward/products");
+        return;
+      }
+      if (task.actionMode === "promo") {
+        router.push("/promo");
+        return;
+      }
+      if (task.actionMode === "bind") {
+        toast("当前版本暂未接入该绑定任务，请在主站完成绑定后再回来领取。");
+        return;
+      }
+      let verifyCode = "";
+      if (task.actionMode === "verify") {
+        const prompt = await appPrompt(`领取任务：${task.name}`, "", {
+          message: task.verifyMessage || "请输入任务验证码后继续。",
+          confirmText: "提交验证",
+          inputPlaceholder: task.verifyHints.length ? `例如：${task.verifyHints.join(" / ")}` : "请输入验证码",
+          inputLabel: "验证码"
+        });
+        if (!prompt.ok) return;
+        verifyCode = String(prompt.value || "").trim();
+        if (!verifyCode) {
+          toast("请输入验证码后再提交。");
+          return;
+        }
+      }
+      taskLoadingMap[task.id] = true;
+      showAppWait("账号积分任务提交中，请稍候。", "积分任务");
+      try {
+        await claimTaskWithCaptcha(task, verifyCode);
+        toast(`任务「${task.name}」处理成功`);
+        await Promise.allSettled([
+          refreshSummary(true),
+          loadRewardTasks(true)
+        ]);
+      } catch (e) {
+        const msg = String(e || "");
+        toast(msg.includes("CommonCaptchaError") ? "验证码校验失败，请重试。" : `任务处理失败：${msg}`);
+      } finally {
+        hideAppWait();
+        taskLoadingMap[task.id] = false;
+      }
+    }
+
+    async function claimRewardProduct(row) {
+      if (!row) return;
+      if (row.unsubscribeAble) {
+        const confirmed = await appConfirm("领取后不支持退回积分，确认继续领取该消费奖励吗？", {
+          title: "领取消费积分",
+          confirmText: "继续领取"
+        });
+        if (!confirmed) return;
+      }
+      productClaimLoadingMap[row.id] = true;
+      showAppWait("消费积分领取中，请稍候。", "消费积分");
+      try {
+        await apiRequest("POST", "/user/reward/products", {
+          product_id: row.productId,
+          product_type: row.productType
+        });
+        toast(`已领取 #${row.productId} 的消费积分`);
+        await Promise.allSettled([
+          refreshSummary(true),
+          loadRewardProducts(true)
+        ]);
+      } catch (e) {
+        toast(`领取失败：${String(e || "")}`);
+      } finally {
+        hideAppWait();
+        productClaimLoadingMap[row.id] = false;
+      }
+    }
+
+    async function claimAllRewardProducts() {
+      if (!rewardProductRows.value.length) return;
+      const confirmed = await appConfirm(`确认一键领取当前 ${rewardProductRows.value.length} 条消费积分记录吗？`, {
+        title: "一键领取",
+        confirmText: "全部领取"
+      });
+      if (!confirmed) return;
+      productsClaimAllLoading.value = true;
+      showAppWait("消费积分批量领取中，请稍候。", "消费积分");
+      let success = 0;
+      try {
+        for (const row of rewardProductRows.value) {
+          await apiRequest("POST", "/user/reward/products", {
+            product_id: row.productId,
+            product_type: row.productType
+          });
+          success += 1;
+        }
+        toast(`批量领取完成，共成功 ${success} 条`);
+        await Promise.allSettled([
+          refreshSummary(true),
+          loadRewardProducts(true)
+        ]);
+      } catch (e) {
+        toast(`批量领取中断：${String(e || "")}`);
+      } finally {
+        hideAppWait();
+        productsClaimAllLoading.value = false;
+      }
+    }
+
+    async function activateCouponCode() {
+      const code = String(couponCode.value || "").trim();
+      if (!code) return;
+      couponActivating.value = true;
+      showAppWait("兑换码激活中，请稍候。", "积分商城");
+      try {
+        await apiRequest("POST", "/user/coupons/active", { code });
+        couponCode.value = "";
+        toast("兑换码激活成功");
+        await Promise.allSettled([
+          refreshSummary(true),
+          loadRewardStore(true)
+        ]);
+      } catch (e) {
+        toast(`兑换码激活失败：${String(e || "")}`);
+      } finally {
+        hideAppWait();
+        couponActivating.value = false;
+      }
+    }
+
+    async function redeemRewardItem(item) {
+      if (!item) return;
+      const confirmed = await appConfirm(
+        item.type === "product"
+          ? "确认使用积分兑换该商品吗？领取后不支持退回积分，试用后续费视为新购。"
+          : `确认使用 ${item.pointsText} 积分兑换「${item.title}」吗？`,
+        {
+          title: "积分商城",
+          confirmText: item.type === "accessories" ? "确认兑换" : "立即领取"
+        }
+      );
+      if (!confirmed) return;
+      storeRedeemLoadingMap[item.id] = true;
+      showAppWait("积分商品兑换中，请稍候。", "积分商城");
+      try {
+        const itemId = Number(item.id);
+        await apiRequest("POST", "/user/reward/items", {
+          item_id: Number.isFinite(itemId) ? itemId : item.id
+        });
+        toast(`「${item.title}」处理成功`);
+        await Promise.allSettled([
+          refreshSummary(true),
+          loadRewardStore(true)
+        ]);
+      } catch (e) {
+        toast(`兑换失败：${String(e || "")}`);
+      } finally {
+        hideAppWait();
+        storeRedeemLoadingMap[item.id] = false;
+      }
+    }
+
+    async function submitRewardWithdraw() {
+      const points = Math.max(0, Number(withdrawForm.points || 0));
+      if (!Number.isFinite(points) || points < 60000) {
+        toast("最少提现 60000 积分（30 元）。");
+        return;
+      }
+      if (points > withdrawAvailablePointsRaw.value) {
+        toast("当前可提现积分不足，请重新确认后再提交。");
+        return;
+      }
+      if (withdrawForm.target === "alipay") {
+        const alipayAccount = String(
+          pickFirstFieldDeep(profile.value, ["AlipayAccount", "alipay_account", "alipay"])
+          || pickFirstFieldDeep(rawData.value, ["AlipayAccount", "alipay_account", "alipay"])
+          || ""
+        ).trim();
+        if (!alipayAccount) {
+          toast("当前账号未绑定支付宝，暂无法提现到支付宝。");
+          return;
+        }
+      }
+      const confirmed = await appConfirm(`确认提现吗？本次将提交 ${formatCount(points)} 积分，预计到账 ${formatMoney(withdrawPreviewValue.value)}。`, {
+        title: "积分提现",
+        confirmText: "确认提交"
+      });
+      if (!confirmed) return;
+      withdrawSubmitting.value = true;
+      showAppWait("积分提现申请提交中，请稍候。", "积分提现");
+      try {
+        await apiRequest("POST", "/user/reward/withdraw", {
+          points,
+          target: withdrawForm.target
+        });
+        withdrawForm.points = "";
+        toast("提现申请已提交");
+        await Promise.allSettled([
+          refreshSummary(true),
+          loadRewardWithdraw(true)
+        ]);
+      } catch (e) {
+        toast(`提现失败：${String(e || "")}`);
+      } finally {
+        hideAppWait();
+        withdrawSubmitting.value = false;
+      }
+    }
+
+    function goLogin() {
+      router.push("/login");
+    }
+
+    async function loadCurrentRewardPage(force = false) {
+      if (!isAuthed.value) {
+        taskRows.value = [];
+        rewardProductRows.value = [];
+        rewardStoreGroups.value = [];
+        withdrawRows.value = [];
+        rewardUpdatedAt.value = "";
+        taskErrorText.value = "";
+        productsErrorText.value = "";
+        storeErrorText.value = "";
+        withdrawErrorText.value = "";
+        return;
+      }
+      if (pageMode.value === "home") {
+        await loadReward(force);
+        return;
+      }
+      refreshing.value = force;
+      try {
+        await refreshSummary(force);
+        rewardUpdatedAt.value = new Date().toLocaleTimeString();
+        if (pageMode.value === "tasks") await loadRewardTasks(force);
+        if (pageMode.value === "products") await loadRewardProducts(force);
+        if (pageMode.value === "store") await loadRewardStore(force);
+        if (pageMode.value === "withdraw") await loadRewardWithdraw(force);
+      } finally {
+        refreshing.value = false;
+      }
+    }
+
+    onMounted(() => {
+      if (isAuthed.value) {
+        loadCurrentRewardPage(false);
+      }
+    });
+    watch(isAuthed, (value) => {
+      if (value) {
+        loadCurrentRewardPage(false);
+      } else {
+        taskRows.value = [];
+        rewardProductRows.value = [];
+        rewardStoreGroups.value = [];
+        withdrawRows.value = [];
+        rewardUpdatedAt.value = "";
+        taskErrorText.value = "";
+        productsErrorText.value = "";
+        storeErrorText.value = "";
+        withdrawErrorText.value = "";
+      }
+    });
+    watch(() => route.path, () => {
+      if (isAuthed.value) loadCurrentRewardPage(false);
+    });
+
+    return {
+      isAuthed,
+      loading,
+      refreshing,
+      taskErrorText,
+      productsErrorText,
+      storeErrorText,
+      withdrawErrorText,
+      taskRows,
+      rewardUpdatedAt,
+      rewardProductRows,
+      rewardProductsTotalText,
+      rewardStoreGroups,
+      withdrawRows,
+      productsLoading,
+      storeLoading,
+      withdrawLoading,
+      productsClaimAllLoading,
+      couponActivating,
+      withdrawSubmitting,
+      couponCode,
+      withdrawForm,
+      withdrawPreviewText,
+      withdrawAvailablePointsText,
+      withdrawQuickActions,
+      activeSection,
+      rewardAnimated,
+      rewardEntries,
+      rewardUses,
+      pageMode,
+      pageTitle,
+      taskSummary,
+      refreshReward,
+      refreshRewardProducts,
+      refreshRewardStore,
+      refreshRewardWithdraw,
+      fillWithdrawPoints,
+      handleTask,
+      claimRewardProduct,
+      claimAllRewardProducts,
+      activateCouponCode,
+      redeemRewardItem,
+      submitRewardWithdraw,
+      openRewardSection,
+      goRewardHome,
+      goToSection,
+      setSectionRef,
+      taskLoadingMap,
+      productClaimLoadingMap,
+      storeRedeemLoadingMap,
+      goLogin
     };
   }
 };
@@ -5838,6 +6946,11 @@ const routes = [
   { path: "/", redirect: "/home" },
   { path: "/login", component: LoginPage },
   { path: "/home", component: HomePage },
+  { path: "/reward", component: RewardPage },
+  { path: "/reward/tasks", component: RewardPage },
+  { path: "/reward/products", component: RewardPage },
+  { path: "/reward/store", component: RewardPage },
+  { path: "/reward/withdraw", component: RewardPage },
   { path: "/promo", component: PromoPage },
   { path: "/me", component: MePage },
   { path: "/todo/:type", component: TodoPage },
@@ -5865,7 +6978,7 @@ const RootApp = {
         </div>
       </transition>
       <router-view v-slot="{ Component, route }">
-        <transition :css="false" @enter="onPageEnter" @leave="onPageLeave">
+        <transition mode="out-in" :css="false" @enter="onPageEnter" @leave="onPageLeave">
           <component :is="Component" :key="route.fullPath" />
         </transition>
       </router-view>
@@ -6247,7 +7360,7 @@ const RootApp = {
 };
 
 router.beforeEach((to) => {
-  if (!isAuthenticated() && to.path === "/me") {
+  if (!isAuthenticated() && (to.path === "/me")) {
     toast("请先登录");
     return "/login";
   }
@@ -6259,23 +7372,24 @@ router.beforeEach((to) => {
 
 async function setupAndroidBackHandler() {
   if (!Capacitor.isNativePlatform() || Capacitor.getPlatform() !== "android") return;
-  try {
-    const { App: CapacitorApp } = await import("@capacitor/app");
-    let lastBackAt = 0;
-    const isTabRootPath = (path) => {
-      const p = String(path || "/");
-      return p === "/" || p === "/home" || p === "/promo" || p === "/me" || p === "/login";
-    };
-    const fallbackRouteByPath = (path) => {
-      const p = String(path || "/");
-      if (p === "/" || p === "/home") return "/home";
-      if (p.startsWith("/todo/")) return "/home";
+    try {
+      const { App: CapacitorApp } = await import("@capacitor/app");
+      let lastBackAt = 0;
+      const isTabRootPath = (path) => {
+        const p = String(path || "/");
+        return p === "/" || p === "/home" || p === "/reward" || p === "/promo" || p === "/me" || p === "/login";
+      };
+      const fallbackRouteByPath = (path) => {
+        const p = String(path || "/");
+        if (p === "/" || p === "/home") return "/home";
+        if (p.startsWith("/todo/")) return "/home";
       if (p.startsWith("/product/")) {
         const seg = p.split("/").filter(Boolean);
         if (seg.length >= 3) return `/product/${seg[1]}`;
         return "/home";
       }
-      if (p === "/promo" || p === "/me") return "/home";
+      if (p.startsWith("/reward/")) return "/reward";
+      if (p === "/reward" || p === "/promo" || p === "/me") return "/home";
       return "/home";
     };
     CapacitorApp.addListener("backButton", ({ canGoBack }) => {

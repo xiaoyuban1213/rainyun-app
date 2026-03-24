@@ -58,7 +58,7 @@ body {
   min-height: 100vh;
   margin: 0 auto;
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr) auto;
   background: linear-gradient(180deg, rgba(250, 253, 255, 0.78), rgba(240, 247, 255, 0.62));
   backdrop-filter: blur(12px);
   position: relative;
@@ -271,7 +271,7 @@ body {
   overflow-y: auto;
   overflow-x: hidden;
   padding: 12px;
-  padding-bottom: calc(var(--shell-tabbar-height) + 48px + env(safe-area-inset-bottom));
+  padding-bottom: calc(18px + env(safe-area-inset-bottom));
   display: grid;
   gap: 12px;
   align-content: start;
@@ -281,7 +281,7 @@ body {
   overscroll-behavior-x: none;
 }
 .m-main.m-main-login {
-  padding-bottom: calc(var(--shell-tabbar-height) + var(--login-bottom-buffer) + env(safe-area-inset-bottom));
+  padding-bottom: calc(var(--login-bottom-buffer) + env(safe-area-inset-bottom));
 }
 .m-main > * { min-width: 0; }
 .m-main > .panel {
@@ -1364,6 +1364,396 @@ html[data-motion-paused="1"] .promo-report-row {
 .kpi-grid div { background: linear-gradient(150deg, var(--surface-0), var(--surface-2)); border: 1px solid var(--line); border-radius: 12px; padding: 11px; }
 .kpi-grid b { display: block; font-size: 21px; line-height: 1.1; letter-spacing: .2px; word-break: break-word; }
 .kpi-grid span { color: var(--muted); font-size: 12px; }
+.reward-stat-grid .stat-cell b {
+  letter-spacing: 0;
+}
+.reward-overview-panel {
+  background: linear-gradient(160deg, rgba(255, 255, 255, 0.94), rgba(243, 248, 255, 0.92));
+}
+.reward-stat-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+.reward-stat-grid .stat-cell-featured {
+  grid-column: 1 / -1;
+  padding: 13px 14px;
+  gap: 8px;
+  background: linear-gradient(145deg, rgba(255, 255, 255, 0.98), rgba(235, 244, 255, 0.94));
+  box-shadow: 0 10px 24px rgba(60, 95, 140, 0.1);
+}
+.reward-entry-head {
+  align-items: center;
+}
+.reward-entry-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.reward-entry-arrow {
+  color: #88a2c5;
+  font-size: 12px;
+  transition: transform 0.16s ease, color 0.16s ease;
+}
+.reward-entry-grid .entry-meta {
+  display: grid;
+  gap: 3px;
+}
+.reward-entry-grid .entry-meta em {
+  font-size: 18px;
+  line-height: 1.15;
+  color: #2f4e77;
+}
+.reward-entry-grid .entry-meta small {
+  color: var(--muted);
+  font-size: 12px;
+}
+.reward-entry-grid .entry {
+  min-height: 108px;
+  gap: 10px;
+  transition: transform 0.16s ease, box-shadow 0.18s ease, border-color 0.18s ease, background 0.18s ease;
+}
+.reward-entry-grid .entry:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 10px 22px rgba(56, 110, 175, 0.12);
+}
+.reward-entry-grid .entry:hover .reward-entry-arrow {
+  transform: translateX(2px);
+  color: #5d86bb;
+}
+.reward-entry-grid .entry.active {
+  border-color: rgba(42, 120, 214, 0.52);
+  background: linear-gradient(150deg, rgba(240, 248, 255, 0.96), rgba(226, 239, 255, 0.92));
+  box-shadow: 0 10px 24px rgba(56, 110, 175, 0.12);
+}
+.reward-section-panel {
+  background: linear-gradient(160deg, rgba(255, 255, 255, 0.95), rgba(243, 248, 255, 0.92));
+}
+.reward-section-panel .panel-title {
+  margin-bottom: 12px;
+  align-items: center;
+}
+.reward-section-panel .panel-subtext {
+  color: #7086a5 !important;
+}
+.panel-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+.reward-subpage-actions {
+  padding-top: 10px;
+}
+.reward-usage-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+.reward-usage-item {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: linear-gradient(150deg, var(--surface-0), var(--surface-2));
+  padding: 11px;
+  display: grid;
+  gap: 8px;
+  box-shadow: 0 4px 10px rgba(60, 95, 140, 0.08);
+}
+.reward-usage-head {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: #35557c;
+}
+.reward-usage-head i {
+  color: var(--primary);
+}
+.reward-usage-head b {
+  font-size: 14px;
+}
+.reward-usage-item p {
+  margin: 0;
+  color: #5f7595;
+  line-height: 1.55;
+  font-size: 13px;
+}
+.reward-task-list {
+  display: grid;
+  gap: 12px;
+}
+.reward-task-item {
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: linear-gradient(155deg, rgba(255, 255, 255, 0.98), rgba(240, 247, 255, 0.92));
+  padding: 12px;
+  display: grid;
+  gap: 9px;
+  box-shadow: 0 6px 14px rgba(60, 95, 140, 0.08);
+}
+.reward-task-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+.reward-task-head b {
+  min-width: 0;
+  font-size: 14px;
+  color: #2f476d;
+}
+.reward-task-item p {
+  margin: 0;
+  color: #617898;
+  line-height: 1.55;
+  font-size: 13px;
+}
+.reward-task-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.reward-task-foot span {
+  color: #2571b8;
+  font-size: 13px;
+  font-weight: 700;
+}
+.reward-product-list,
+.reward-store-groups,
+.reward-withdraw-list {
+  display: grid;
+  gap: 12px;
+}
+.reward-product-item,
+.reward-store-group,
+.reward-withdraw-item,
+.reward-withdraw-form {
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: linear-gradient(155deg, rgba(255, 255, 255, 0.98), rgba(240, 247, 255, 0.92));
+  padding: 12px;
+  box-shadow: 0 6px 14px rgba(60, 95, 140, 0.08);
+}
+.reward-product-head,
+.reward-store-item-head,
+.reward-store-group-head,
+.reward-withdraw-item-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+.reward-product-head b,
+.reward-store-item-head b,
+.reward-store-group-head b,
+.reward-withdraw-item-head b {
+  font-size: 14px;
+  color: #2f476d;
+}
+.reward-product-head small,
+.reward-store-group-head span,
+.reward-withdraw-item small,
+.reward-store-item-foot small {
+  color: #6b7f9d;
+  font-size: 12px;
+}
+.reward-product-head strong,
+.reward-store-item-head span {
+  color: #2571b8;
+  font-size: 13px;
+  font-weight: 700;
+}
+.reward-store-group-head {
+  padding-bottom: 2px;
+}
+.reward-product-meta,
+.reward-store-item p,
+.reward-withdraw-item p {
+  margin: 8px 0 0;
+  color: #617898;
+  line-height: 1.55;
+  font-size: 13px;
+}
+.reward-product-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+}
+.reward-product-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 10px;
+}
+.reward-inline-form {
+  display: grid;
+  gap: 10px;
+  margin-bottom: 12px;
+  padding: 12px;
+  border: 1px solid rgba(205, 223, 245, 0.95);
+  border-radius: 14px;
+  background: linear-gradient(160deg, rgba(249, 252, 255, 0.96), rgba(242, 248, 255, 0.92));
+}
+.reward-inline-form label,
+.reward-withdraw-form label {
+  font-size: 13px;
+  color: #4f6381;
+  font-weight: 700;
+}
+.reward-inline-form-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+}
+.reward-inline-form input,
+.reward-withdraw-form input {
+  width: 100%;
+  min-height: 42px;
+  border: 1px solid rgba(121, 169, 232, 0.55);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.9);
+  padding: 0 14px;
+  font-size: 14px;
+  color: #2d456b;
+  outline: none;
+}
+.reward-inline-form input:focus,
+.reward-withdraw-form input:focus {
+  border-color: rgba(42, 120, 214, 0.72);
+  box-shadow: 0 0 0 3px rgba(76, 146, 231, 0.14);
+}
+.reward-store-grid,
+.reward-withdraw-grid {
+  display: grid;
+  gap: 10px;
+}
+.reward-store-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.reward-withdraw-grid {
+  grid-template-columns: minmax(248px, 320px) minmax(0, 1fr);
+  align-items: start;
+}
+.reward-store-item {
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.66);
+  padding: 10px;
+  display: grid;
+  gap: 8px;
+}
+.reward-store-item-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.reward-withdraw-form {
+  display: grid;
+  gap: 10px;
+  align-self: start;
+}
+.reward-withdraw-balance {
+  display: grid;
+  gap: 4px;
+  padding: 12px 14px;
+  border: 1px solid rgba(121, 169, 232, 0.38);
+  border-radius: 14px;
+  background: linear-gradient(180deg, rgba(247, 251, 255, 0.96), rgba(238, 246, 255, 0.88));
+}
+.reward-withdraw-balance span,
+.reward-withdraw-balance small {
+  color: #637b9d;
+}
+.reward-withdraw-balance b {
+  font-size: 22px;
+  line-height: 1.1;
+  color: #2f476d;
+}
+.reward-withdraw-quick {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+.reward-withdraw-targets {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.chip-btn {
+  min-height: 36px;
+  border-radius: 999px;
+  border: 1px solid rgba(121, 169, 232, 0.55);
+  background: rgba(255, 255, 255, 0.76);
+  color: #4f6687;
+  padding: 0 14px;
+  font-size: 13px;
+  font-weight: 700;
+  transition:
+    transform 0.14s ease,
+    box-shadow 0.18s ease,
+    border-color 0.18s ease,
+    background 0.18s ease,
+    color 0.18s ease;
+  box-shadow: 0 2px 6px rgba(60, 95, 140, 0.06);
+  will-change: transform;
+}
+.chip-btn.active {
+  border-color: rgba(42, 120, 214, 0.72);
+  background: linear-gradient(135deg, rgba(229, 242, 255, 0.96), rgba(210, 230, 255, 0.94));
+  color: #2368b1;
+}
+.chip-btn:not(:disabled):hover {
+  border-color: rgba(72, 140, 220, 0.62);
+  box-shadow: 0 6px 14px rgba(60, 95, 140, 0.12);
+}
+.chip-btn:not(:disabled):active {
+  transform: translateY(1px) scale(0.985);
+  box-shadow: 0 1px 4px rgba(60, 95, 140, 0.08);
+}
+.chip-btn:not(:disabled):focus-visible {
+  outline: none;
+  box-shadow:
+    0 0 0 3px rgba(76, 146, 231, 0.16),
+    0 6px 14px rgba(60, 95, 140, 0.12);
+}
+.chip-btn.quick {
+  min-height: 40px;
+  border-radius: 12px;
+  justify-content: center;
+}
+.chip-btn.disabled,
+.chip-btn:disabled {
+  border-color: rgba(177, 194, 221, 0.72);
+  background: rgba(241, 245, 252, 0.92);
+  color: #9aa9c0;
+  cursor: not-allowed;
+}
+.reward-withdraw-hint {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  color: #5e7492;
+}
+.reward-withdraw-hint b {
+  font-size: 20px;
+  color: #2f476d;
+}
+.reward-withdraw-history {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+.reward-withdraw-history .reward-store-group-head {
+  margin-bottom: 2px;
+}
+.reward-withdraw-item {
+  display: grid;
+  gap: 6px;
+}
 .promo-kpi-title {
   grid-column: 1 / -1;
   margin-bottom: 0;
@@ -1959,15 +2349,12 @@ html[data-motion-paused="1"] .promo-report-row {
 }
 .empty { color: var(--muted); text-align: center; padding: 18px 0; }
 .m-tabbar {
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: 0;
+  position: relative;
   width: 100%;
   background: rgba(255, 255, 255, 0.94);
   border-top: 1px solid var(--line);
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   padding: 6px 8px calc(6px + env(safe-area-inset-bottom));
   gap: 6px;
   z-index: 120;
@@ -2239,12 +2626,38 @@ html[data-motion-paused="1"] .promo-report-row {
   .quick-actions-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
+  .reward-usage-grid {
+    grid-template-columns: 1fr;
+  }
+  .reward-store-grid,
+  .reward-withdraw-grid,
+  .reward-inline-form-row {
+    grid-template-columns: 1fr;
+  }
+  .reward-withdraw-quick {
+    grid-template-columns: 1fr;
+  }
+  .reward-store-item-foot,
+  .reward-product-actions {
+    justify-content: stretch;
+  }
+  .reward-store-item-foot .arco-btn,
+  .reward-product-actions .arco-btn,
+  .reward-inline-form-row .arco-btn {
+    width: 100%;
+  }
+}
+
+@media (max-width: 980px) {
+  .reward-withdraw-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
 @media (max-width: 360px) {
   .m-main {
     padding: 10px;
-    padding-bottom: calc(var(--shell-tabbar-height) + 42px + env(safe-area-inset-bottom));
+    padding-bottom: calc(14px + env(safe-area-inset-bottom));
     gap: 10px;
   }
   .panel {
@@ -2260,6 +2673,9 @@ html[data-motion-paused="1"] .promo-report-row {
   .panel-title h3 { font-size: 15px; }
   .panel-title small { font-size: 11px; }
   .title-actions small { display: none; }
+  .reward-stat-grid .stat-cell-featured {
+    padding: 11px 12px;
+  }
   .news-item {
     padding: 8px 9px;
     gap: 6px;
@@ -2329,7 +2745,7 @@ html[data-motion-paused="1"] .promo-report-row {
 
   .m-main {
     padding: 8px;
-    padding-bottom: calc(var(--shell-tabbar-height) + 38px + env(safe-area-inset-bottom));
+    padding-bottom: calc(12px + env(safe-area-inset-bottom));
     gap: 8px;
   }
   .panel {
@@ -2383,6 +2799,22 @@ html[data-motion-paused="1"] .promo-report-row {
   }
   .entry {
     padding: 9px;
+  }
+  .reward-entry-grid .entry {
+    min-height: 94px;
+    gap: 8px;
+  }
+  .reward-entry-grid .entry-meta em {
+    font-size: 16px;
+  }
+  .reward-inline-form,
+  .reward-product-item,
+  .reward-store-group,
+  .reward-withdraw-item,
+  .reward-withdraw-form,
+  .reward-task-item {
+    padding: 10px;
+    border-radius: 12px;
   }
 
   .panel-title {
